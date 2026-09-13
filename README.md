@@ -24,7 +24,7 @@ Self-hosted FiveM operations console with real-time player telemetry, GTA V map 
 - **Bundled CFX capture path:** the resource ships the required CFX/Three capture runtime directly, so it does not depend on an external screenshot resource at runtime.
 - **Custom scaled readback/packing path:** frames are rendered at the requested capture scale before pixel readback, then packed into canvas `ImageData` and encoded as WebP.
 
-The result is a sharp little observability pipeline: telemetry stays cheap, capture work moves to the edge, and backend bandwidth follows actual operator intent instead of global broadcast pressure.
+The result is a compact observability pipeline: telemetry stays cheap, capture work moves to the edge, and backend bandwidth follows actual operator intent instead of global broadcast pressure.
 
 ```txt
 NUI frame for player #24
@@ -201,13 +201,18 @@ Socket roles:
 
 See [docs/API.md](docs/API.md).
 
-## Operational Posture
+## Failure Model & Scaling Boundaries
 
-- Single-node by design for easy self-hosting.
-- Runtime state is in memory.
-- Snapshot telemetry self-heals on the next interval.
-- Stream routing is demand-driven.
-- Horizontal scale can be added later with Redis/socket state and media gateway workers.
+The current design intentionally optimizes for a **single self-hosted control plane** instead of pretending to be horizontally distributed.
+
+- Runtime player/socket/watcher state is in memory. A backend restart drops transient stream state and connected sockets.
+- Snapshot telemetry is disposable: the next ingest interval repopulates current player state.
+- Live video is also transient by design. There is no recording pipeline or durable media queue in the current target.
+- A player with zero watchers should not be paying the capture/encode cost; stream lifecycle is tied to watcher demand.
+- Multiple operators can share one player capture loop, but backend egress still grows with the number of subscribed viewers receiving frames.
+- Horizontal scaling would require shared socket/watcher state (for example Redis) and, at larger media loads, dedicated relay/media workers.
+
+Those are not hidden shortcomings; they are the explicit boundary of the current architecture. The project favors an understandable operational model first, with a clear path to distributed state only when the workload justifies it.
 
 ## Production Baseline
 
