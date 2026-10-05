@@ -1,180 +1,72 @@
-# fivem-watch
+# fivem-watch FiveM Runtime (`fivem-watch-resource`)
 
-Self-hosted FiveM operations console with real-time player telemetry, GTA V map visibility, and demand-driven live player streaming.
+FiveM resource that produces telemetry and on-demand NUI screen frames for the `fivem-watch` control plane.
 
-`fivem-watch` is built for server teams that need live context without putting staff into the game for every check. It combines a lightweight control plane, distributed NUI capture, and watcher-scoped stream relay so operators can see what matters without turning every player client into a permanent video source.
+The resource stays intentionally thin, but the capture path is where the project gets interesting: it bundles the needed CFX/Three primitives, captures through hidden NUI, scales before readback, packs pixels into `ImageData`, and ships WebP frames without requiring an external screenshot resource at runtime.
 
-<p align="left">
-  <img alt="License" src="https://img.shields.io/badge/license-MIT-green" />
-  <img alt="Node.js" src="https://img.shields.io/badge/node-%3E%3D18-339933" />
-  <img alt="Architecture" src="https://img.shields.io/badge/architecture-watcher--scoped%20relay-blue" />
-</p>
+## Responsibilities
 
-## Preview
+- Collect connected player telemetry at a fixed interval.
+- Send full snapshots to backend `/api/ingest`.
+- Bootstrap a hidden NUI page on player clients.
+- Connect NUI clients to the backend as `fivem-nui`.
+- Capture frames only after `start_capture`.
+- Stop capture after `stop_capture`.
+- Apply runtime stream settings without resource restart.
+- Use a bundled CFX/Three capture runtime instead of requiring an external screenshot resource at runtime.
 
-[Watch preview video](https://streamable.com/da58u5)
+## Files
 
-## Engineering Highlights
+| File | Purpose |
+|---|---|
+| `fxmanifest.lua` | Resource manifest |
+| `config.js` | Shared backend and stream config |
+| `server/main.js` | Telemetry collector and HTTP publisher |
+| `client/main.js` | NUI bootstrap bridge |
+| `web/index.html` | WebGL capture engine |
+| `web/socket.io.min.js` | Bundled Socket.io client |
+| `web/cfx-three.min.js` | Bundled CFX Three.js integration |
 
-`fivem-watch` is designed to feel powerful without being wasteful: the impressive part is live remote visibility; the operational part is that every expensive step is tied to explicit operator demand.
+## Capture Pipeline
 
-- **Watcher-scoped relay:** the backend tracks watchers per player and sends frames only to subscribed operators.
-- **Demand-driven capture:** screen capture starts only after an authenticated operator requests a stream.
-- **Distributed capture workload:** frame capture and encode run on the player-side NUI client, while the backend keeps routing and policy centralized.
-- **Bundled CFX capture path:** the resource ships the required CFX/Three capture runtime directly, so it does not depend on an external screenshot resource at runtime.
-- **Custom scaled readback/packing path:** frames are rendered at the requested capture scale before pixel readback, then packed into canvas `ImageData` and encoded as WebP.
-
-The result is a compact observability pipeline: telemetry stays cheap, capture work moves to the edge, and backend bandwidth follows actual operator intent instead of global broadcast pressure.
-
-```txt
-NUI frame for player #24
-      ↓
-backend checks streamWatchers["24"]
-      ↓
-only subscribed operators receive the frame
-      ↓
-zero watchers means stop_capture
-```
-
-## Why Central Relay, Not P2P?
-
-P2P looks attractive on paper. For an operator console, centralized relay is the stronger default because the backend is where auth, policy, cleanup, and stream ownership belong.
-
-| Choice | Looks cool | Works well for ops | Why |
-|---|---:|---:|---|
-| P2P | High | Medium | NAT, firewall, browser permission, peer churn, and policy enforcement get messy |
-| Central relay | High | High | One control plane owns auth, stream lifecycle, watcher accounting, and routing |
-
-For moderation and observability tooling, control beats novelty. The backend is not just a pipe; it is the thing that makes the system operable under real server conditions.
-
-The architecture is best described as:
-
-> A real-time control plane with distributed NUI capture and watcher-scoped stream relay.
-
-## Capabilities
-
-- Operator login through the backend.
-- Player telemetry ingest from the FiveM resource.
-- Live player list with ID, name, ping, health, armor, and coordinates.
-- GTA V satellite map rendering with player markers.
-- On-demand live player stream windows.
-- Multiple operators watching the same player without duplicate capture loops.
-- Multiple player streams in the dashboard.
-- Runtime stream quality updates.
-- Automatic capture shutdown when nobody is watching.
-- Bundled CFX/Three capture runtime with scaled WebGL readback and WebP encoding.
-- No mandatory database, Redis, or external media server for the current single-node target.
-
-## Architecture
+The NUI capture path is self-contained inside this resource.
 
 ```txt
-FiveM Resource
-  ├─ server/main.js      player snapshot producer
-  ├─ client/main.js      hidden NUI bootstrap
-  └─ web/index.html      WebGL capture engine
-
-        ↓ HTTP + Socket.io
-
-Backend Control Plane
-  ├─ Express REST API
-  ├─ Socket.io router
-  ├─ in-memory player state
-  ├─ NUI socket index
-  └─ per-player watcher registry
-
-        ↓ Socket.io
-
-Operator Dashboard
-  ├─ auth screen
-  ├─ searchable player list
-  ├─ GTA V map
-  └─ live stream overlays
+CfxTexture
+  -> scaled WebGL render target
+  -> pixel readback
+  -> packed canvas ImageData
+  -> WebP encode
+  -> Socket.io frame
 ```
 
-## Repository Layout
+The render target is created at `viewport x STREAM_RESOLUTION_SCALE`, so resize happens before GPU readback instead of after a full-resolution copy. The scaled RGBA buffer is then packed into canvas `ImageData` and encoded as WebP. At `0.4` scale, that cuts pixel transfer substantially before the frame is encoded.
 
-```txt
-.
-├─ client/                 # React + Vite operator dashboard
-├─ server/                 # Express + Socket.io control plane
-├─ fivem-watch-resource/   # FiveM telemetry and NUI capture resource
-├─ docs/                   # API and configuration references
-├─ INSTALL.md              # setup, deployment, and runbook
-├─ TECHNICAL-ARCHITECTURE.md
-├─ CONTRIBUTING.md
-├─ VERSIONING.md
-└─ LICENSE
-```
+This keeps the resource independent from a separate screenshot runtime while still reusing the necessary CFX/Three capture primitives in a bundled form. The result is edge-side image processing with backend-controlled stream lifecycle.
 
-## Quick Start
-
-### 1. Backend
-
-```bash
-cd server
-cp .env.example .env
-npm install
-npm start
-```
-
-Edit `server/.env`:
-
-```env
-PORT=3001
-NODE_ENV=development
-API_SECRET=CHANGE_ME_TO_A_RANDOM_SECRET
-ADMIN_USERNAME=admin
-ADMIN_PASSWORD=CHANGE_ME
-CORS_ORIGIN=http://localhost:5173
-```
-
-Generate a real secret:
-
-```bash
-openssl rand -hex 32
-```
-
-### 2. Dashboard
-
-```bash
-cd client
-npm install
-npm run dev
-```
-
-Default URL:
-
-```txt
-http://localhost:5173
-```
-
-Optional `client/.env`:
-
-```env
-VITE_SERVER_URL=http://YOUR_BACKEND_HOST:3001
-```
-
-### 3. FiveM Resource
-
-Copy `fivem-watch-resource/` into your FiveM `resources/` directory.
-
-Recommended path:
-
-```txt
-resources/fivem-watch-resource
-```
-
-Edit `fivem-watch-resource/config.js`:
+## Configuration
 
 ```js
 const FW_CONFIG = {
-  BACKEND_URL: 'http://YOUR_BACKEND_HOST:3001',
-  API_SECRET: 'MATCH_SERVER_ENV_API_SECRET',
+  BACKEND_URL: 'http://localhost:3001',
+  API_SECRET: 'CHANGE_ME_TO_A_RANDOM_SECRET',
   TELEMETRY_INTERVAL: 1000,
   STREAM_FPS: 20,
   STREAM_QUALITY: 0.5,
   STREAM_RESOLUTION_SCALE: 0.5,
 };
+```
+
+`API_SECRET` must match the backend.
+
+## Installation
+
+Copy this folder into FiveM `resources/`.
+
+Recommended path:
+
+```txt
+resources/fivem-watch-resource
 ```
 
 Add to `server.cfg`:
@@ -183,57 +75,34 @@ Add to `server.cfg`:
 ensure fivem-watch-resource
 ```
 
-If you rename the resource folder, update the `nui://fivem-watch-resource/...` script paths in `fivem-watch-resource/web/index.html`.
+Resource naming matters. `web/index.html` currently references `nui://fivem-watch-resource/...`; update those paths if the folder is renamed.
 
-## API Surface
+## Runtime Behavior
 
-| Method | Path | Purpose |
-|---|---|---|
-| `POST` | `/api/auth/login` | Operator login |
-| `GET` | `/api/health` | Runtime health and counters |
-| `POST` | `/api/ingest` | FiveM player telemetry ingest |
+Telemetry:
 
-Socket roles:
+```txt
+setInterval -> collect players -> POST /api/ingest
+```
 
-- `admin`
-- `fivem-nui`
-- `fivem-server` compatibility path
+Streaming:
 
-See [docs/API.md](docs/API.md).
+```txt
+backend start_capture -> NUI capture loop -> frame events
+backend stop_capture  -> NUI capture loop stops
+```
 
-## Failure Model & Scaling Boundaries
+No capture loop runs while nobody is watching. That is the operational win behind the live-stream feature.
 
-The current design intentionally optimizes for a **single self-hosted control plane** instead of pretending to be horizontally distributed.
+## Tuning
 
-- Runtime player/socket/watcher state is in memory. A backend restart drops transient stream state and connected sockets.
-- Snapshot telemetry is disposable: the next ingest interval repopulates current player state.
-- Live video is also transient by design. There is no recording pipeline or durable media queue in the current target.
-- A player with zero watchers should not be paying the capture/encode cost; stream lifecycle is tied to watcher demand.
-- Multiple operators can share one player capture loop, but backend egress still grows with the number of subscribed viewers receiving frames.
-- Horizontal scaling would require shared socket/watcher state (for example Redis) and, at larger media loads, dedicated relay/media workers.
+- Lower `STREAM_RESOLUTION_SCALE` first for bandwidth reduction.
+- Lower `STREAM_FPS` for CPU and network relief.
+- Lower `STREAM_QUALITY` when rough visual context is enough.
 
-Those are not hidden shortcomings; they are the explicit boundary of the current architecture. The project favors an understandable operational model first, with a clear path to distributed state only when the workload justifies it.
+## Related Docs
 
-## Production Baseline
-
-- Replace all default credentials.
-- Use HTTPS through a reverse proxy.
-- Set `CORS_ORIGIN` to exact dashboard origins.
-- Keep `API_SECRET` long, random, and private.
-- Set `NODE_ENV=production` so unsafe defaults are rejected at boot.
-- Restrict backend ingress where possible.
-- Run the backend under a process supervisor.
-
-## Documentation
-
-- [INSTALL.md](INSTALL.md) - installation, deployment, and operations
-- [TECHNICAL-ARCHITECTURE.md](TECHNICAL-ARCHITECTURE.md) - architecture, trust zones, scaling path
-- [docs/API.md](docs/API.md) - REST and Socket.io contract
-- [docs/CONFIGURATION.md](docs/CONFIGURATION.md) - environment and runtime config
-- [server/README.md](server/README.md) - backend control plane
-- [client/README.md](client/README.md) - dashboard application
-- [fivem-watch-resource/README.md](fivem-watch-resource/README.md) - FiveM runtime resource
-
-## License
-
-MIT. See [LICENSE](LICENSE).
+- [Root README](../README.md)
+- [Install Guide](../INSTALL.md)
+- [Architecture](../TECHNICAL-ARCHITECTURE.md)
+- [Configuration](../docs/CONFIGURATION.md)

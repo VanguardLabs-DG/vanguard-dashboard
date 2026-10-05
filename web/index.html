@@ -1,0 +1,365 @@
+<!--
+  fivem-watch - Hidden NUI Page
+  Self-contained CFX/Three capture path.
+  Uses the required CfxTexture/WebGL primitives without depending on an
+  external screenshot resource at runtime.
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <style>
+    * { background-color: transparent; margin: 0; padding: 0; }
+    html, body { overflow: hidden; width: 100vw; height: 100vh; }
+    #app {
+      position: fixed;
+      top: -99999px;
+      left: -99999px;
+      width: 1px;
+      height: 1px;
+      opacity: 0;
+      pointer-events: none;
+    }
+  </style>
+</head>
+<body>
+
+<div id="app"></div>
+
+<!-- Socket.io client -->
+<script src="socket.io.min.js"></script>
+
+<!-- @citizenfx/three bundle -->
+<script src="cfx-three.min.js"></script>
+
+<script>
+// ---- State ----
+let socket = null;
+let isCapturing = false;
+let config = {
+  backendUrl: 'https://137.131.156.73.sslip.io',
+  apiSecret: '',
+  playerId: 0,
+  streamFps: 20,
+  streamQuality: 0.5,
+  resolutionScale: 0.4,
+};
+
+// ---- Three.js resources ----
+let renderer, sceneRTT, cameraRTT, rtTexture, material, gameTexture, quad;
+let rawCanvas, rawCtx;
+let outputCanvas, outputCtx;
+let captureRequestPending = false;
+let captureIntervalTimer = null;
+let animateStarted = false;
+
+function getNativeWidth() {
+  return window.innerWidth || (window.screen && window.screen.width) || 1920;
+}
+
+function getNativeHeight() {
+  return window.innerHeight || (window.screen && window.screen.height) || 1080;
+}
+
+function init() {
+  const T = window.CFX_THREE;
+  if (!T) {
+    console.error('[vanguard_dashboard] window.CFX_THREE not available');
+    return;
+  }
+
+  const rw = getNativeWidth();
+  const rh = getNativeHeight();
+
+  // Camera matching exact game viewport
+  cameraRTT = new T.OrthographicCamera(rw / -2, rw / 2, rh / 2, rh / -2, -10000, 10000);
+  cameraRTT.position.z = 100;
+
+  // Scene
+  sceneRTT = new T.Scene();
+
+  // Render Target at exact native game resolution
+  rtTexture = new T.WebGLRenderTarget(rw, rh, {
+    minFilter: T.LinearFilter,
+    magFilter: T.NearestFilter,
+    format: T.RGBAFormat,
+    type: T.UnsignedByteType
+  });
+
+  // Game Texture (CfxTexture)
+  gameTexture = new T.CfxTexture();
+  gameTexture.needsUpdate = true;
+
+  // Material & Shader
+  material = new T.ShaderMaterial({
+    uniforms: { "tDiffuse": { value: gameTexture } },
+    vertexShader: `
+      varying vec2 vUv;
+      void main() {
+        vUv = vec2(uv.x, 1.0-uv.y); // Y-flip
+        gl_Position = projectionMatrix * modelViewMatrix * vec4( position, 1.0 );
+      }
+    `,
+    fragmentShader: `
+      varying vec2 vUv;
+      uniform sampler2D tDiffuse;
+      void main() {
+        vec4 tex = texture2D( tDiffuse, vUv );
+        gl_FragColor = vec4( tex.rgb, 1.0 );
+      }
+    `
+  });
+
+  // Mesh
+  const plane = new T.PlaneGeometry(rw, rh);
+  quad = new T.Mesh(plane, material);
+  quad.position.z = -100;
+  sceneRTT.add(quad);
+
+  // Renderer - 1:1 pixel ratio
+  if (!renderer) {
+    renderer = new T.WebGLRenderer({ antialias: false, alpha: false, preserveDrawingBuffer: true });
+    renderer.setPixelRatio(1);
+    renderer.setSize(rw, rh, false);
+    renderer.autoClear = false;
+
+    // Attach to DOM (offscreen via CSS, NEVER display: none)
+    const appEl = document.getElementById('app');
+    appEl.appendChild(renderer.domElement);
+
+    renderer.domElement.addEventListener('webglcontextlost', (e) => {
+      e.preventDefault();
+      console.warn('[vanguard_dashboard] WebGL context lost!');
+    }, false);
+    renderer.domElement.addEventListener('webglcontextrestored', () => {
+      console.log('[vanguard_dashboard] WebGL context restored, re-initializing...');
+      init();
+    }, false);
+  } else {
+    renderer.setSize(rw, rh, false);
+  }
+
+  // 2D Canvases
+  if (!rawCanvas) {
+    rawCanvas = document.createElement('canvas');
+    rawCtx = rawCanvas.getContext('2d', { willReadFrequently: true });
+  }
+  if (!outputCanvas) {
+    outputCanvas = document.createElement('canvas');
+    outputCtx = outputCanvas.getContext('2d');
+  }
+
+  window.removeEventListener('resize', handleWindowResize);
+  window.addEventListener('resize', handleWindowResize);
+
+  console.log('[vanguard_dashboard] Engine initialized at native resolution:', rw, 'x', rh);
+  if (!animateStarted) {
+    animateStarted = true;
+    animate();
+  }
+}
+
+function handleWindowResize() {
+  const T = window.CFX_THREE;
+  if (!T || !renderer || !rtTexture) return;
+
+  const nw = getNativeWidth();
+  const nh = getNativeHeight();
+  if (rtTexture.width === nw && rtTexture.height === nh) return;
+
+  console.log('[vanguard_dashboard] Display resolution changed to:', nw, 'x', nh);
+
+  if (cameraRTT) {
+    cameraRTT.left = nw / -2;
+    cameraRTT.right = nw / 2;
+    cameraRTT.top = nh / 2;
+    cameraRTT.bottom = nh / -2;
+    cameraRTT.updateProjectionMatrix();
+  }
+
+  try { rtTexture.dispose(); } catch (_e) {}
+  rtTexture = new T.WebGLRenderTarget(nw, nh, {
+    minFilter: T.LinearFilter,
+    magFilter: T.NearestFilter,
+    format: T.RGBAFormat,
+    type: T.UnsignedByteType
+  });
+
+  if (quad && quad.geometry) {
+    try { quad.geometry.dispose(); } catch (_e) {}
+    quad.geometry = new T.PlaneGeometry(nw, nh);
+  }
+
+  renderer.setSize(nw, nh, false);
+  if (gameTexture) gameTexture.needsUpdate = true;
+  if (material) material.needsUpdate = true;
+}
+
+function animate() {
+  requestAnimationFrame(animate);
+
+  if (renderer && sceneRTT && cameraRTT && rtTexture) {
+    renderer.clear();
+    renderer.render(sceneRTT, cameraRTT, rtTexture, true);
+  }
+
+  if (captureRequestPending) {
+    captureRequestPending = false;
+    processCapture();
+  }
+}
+
+function processCapture() {
+  if (!isCapturing || !socket?.connected || !renderer || !rtTexture) return;
+
+  const nativeW = rtTexture.width;
+  const nativeH = rtTexture.height;
+
+  // Read raw pixels
+  const read = new Uint8Array(nativeW * nativeH * 4);
+  renderer.readRenderTargetPixels(rtTexture, 0, 0, nativeW, nativeH, read);
+
+  // Guarantee alpha channel is 255 (completely opaque)
+  const d = new Uint8ClampedArray(read.buffer);
+  for (let i = 3; i < d.length; i += 4) {
+    d[i] = 255;
+  }
+
+  // Draw into native raw staging canvas
+  if (rawCanvas.width !== nativeW || rawCanvas.height !== nativeH) {
+    rawCanvas.width = nativeW;
+    rawCanvas.height = nativeH;
+  }
+  rawCtx.putImageData(new ImageData(d, nativeW, nativeH), 0, 0);
+
+  // Smoothly downscale into outputCanvas for network streaming
+  const scale = Math.max(0.1, Math.min(1.0, config.resolutionScale || 0.4));
+  const scaledW = Math.max(160, Math.floor(nativeW * scale));
+  const scaledH = Math.max(120, Math.floor(nativeH * scale));
+
+  if (outputCanvas.width !== scaledW || outputCanvas.height !== scaledH) {
+    outputCanvas.width = scaledW;
+    outputCanvas.height = scaledH;
+  }
+
+  outputCtx.drawImage(rawCanvas, 0, 0, scaledW, scaledH);
+
+  const dataUrl = outputCanvas.toDataURL('image/webp', config.streamQuality);
+  socket.emit('frame', dataUrl);
+}
+
+window.addEventListener('message', (event) => {
+  const msg = event.data;
+  if (!msg) return;
+  console.log('[vanguard_dashboard NUI] Mensagem recebida:', msg.type);
+  if (msg.type === 'init') {
+    const isSameTarget = socket && socket.connected && config.backendUrl === msg.backendUrl && String(config.playerId) === String(msg.playerId);
+    Object.assign(config, msg);
+    if (isSameTarget) return;
+
+    if (socket) {
+      try { socket.disconnect(); } catch (_e) {}
+      socket = null;
+    }
+    connectToBackend();
+  } else if (msg.type === 'stopCapture') {
+    stopCapture();
+  }
+});
+
+// Dynamic config coming from backend (when admin changes settings)
+function handleConfigUpdate(newConfig) {
+  const oldFps = config.streamFps;
+  Object.assign(config, newConfig);
+
+  // Note: WebGL RenderTarget is NEVER destroyed on config changes!
+  // resolutionScale is applied purely in the 2D canvas drawImage step.
+  if (oldFps !== config.streamFps && isCapturing) {
+    stopCapture();
+    startCapture();
+  }
+}
+
+// ---- Networking & Controls ----
+
+function connectToBackend() {
+  if (socket?.connected) return;
+
+  if (typeof io !== 'function') {
+    console.error('[vanguard_dashboard] socket.io client not available');
+    return;
+  }
+
+  const endpoint = (config.backendUrl || 'https://137.131.156.73.sslip.io').replace(/\/+$/, '');
+  console.log('[vanguard_dashboard] Connecting NUI socket to:', endpoint, 'player:', config.playerId);
+
+  socket = io(endpoint, {
+    auth: { role: 'fivem-nui', secret: config.apiSecret, playerId: config.playerId },
+    transports: ['websocket', 'polling'],
+    reconnection: true,
+    reconnectionAttempts: 30,
+    reconnectionDelay: 2000,
+  });
+
+  socket.on('connect', () => {
+    console.log('[vanguard_dashboard] ✓ NUI Socket connected to backend over WSS');
+    try {
+      const resName = (typeof GetParentResourceName === 'function') ? GetParentResourceName() : 'vanguard_dashboard';
+      fetch(`https://${resName}/nuiConnected`, { method: 'POST', body: '{}' }).catch(() => {});
+    } catch (_e) {}
+  });
+
+  socket.on('connect_error', (err) => {
+    console.warn('[vanguard_dashboard] Socket connection error:', err?.message || err);
+  });
+
+  socket.on('disconnect', (reason) => {
+    console.log('[vanguard_dashboard] Socket disconnected:', reason);
+    stopCapture();
+  });
+
+  socket.on('start_capture', startCapture);
+  socket.on('stop_capture', stopCapture);
+  socket.on('update_config', handleConfigUpdate);
+}
+
+function startCapture() {
+  if (isCapturing) return;
+  isCapturing = true;
+  blackFrameCount = 0;
+
+  if (gameTexture) gameTexture.needsUpdate = true;
+  if (material) material.needsUpdate = true;
+
+  const interval = Math.floor(1000 / config.streamFps);
+  captureIntervalTimer = setInterval(() => {
+    captureRequestPending = true;
+  }, interval);
+  
+  console.log(`[vanguard_dashboard] Capture started at ${config.streamFps} FPS`);
+}
+
+function stopCapture() {
+  isCapturing = false;
+  if (captureIntervalTimer) {
+    clearInterval(captureIntervalTimer);
+    captureIntervalTimer = null;
+  }
+}
+
+// Start graphics engine
+try {
+  init();
+} catch (e) {
+  console.error('[vanguard_dashboard] Failed to initialize Three.js engine:', e);
+}
+
+// Notify client script that NUI DOM and scripts are ready
+try {
+  const resName = (typeof GetParentResourceName === 'function') ? GetParentResourceName() : 'vanguard_dashboard';
+  fetch(`https://${resName}/nuiReady`, { method: 'POST', body: '{}' }).catch(() => {});
+} catch (_e) {}
+
+</script>
+</body>
+</html>
