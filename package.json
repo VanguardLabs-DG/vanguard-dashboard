@@ -1,0 +1,26 @@
+{
+  "name": "vanguard_dashboard",
+  "version": "1.0.0",
+  "description": "FiveM resource that produces telemetry and on-demand NUI screen frames for the `fivem-watch` control plane.",
+  "main": "config.js",
+  "directories": {
+    "doc": "docs"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/VanguardLabs-DG/fivem-watch.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/VanguardLabs-DG/fivem-watch/issues"
+  },
+  "homepage": "https://github.com/VanguardLabs-DG/fivem-watch#readme",
+  "dependencies": {
+    "socket.io-client": "^4.8.4"
+  }
+}

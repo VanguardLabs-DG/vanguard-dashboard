@@ -5,15 +5,12 @@
  * ║  Repository: https://github.com/user/fivem-watch            ║
  * ╚══════════════════════════════════════════════════════════════╝
  *
- * This server handles two primary responsibilities:
- *
- * 1. TELEMETRY — Receives player location/status data from the
- *    FiveM server script and broadcasts it to admin dashboards.
- *
- * 2. MEDIA STREAM — Relays live screenshot frames captured from
- *    a player's game client (via NUI WebGL) to admin viewers.
- *
- * All communication uses Socket.io (WebSocket) for minimal latency.
+ * This server handles primary responsibilities:
+ * 1. TELEMETRY — Receives player location, RP dossier, vehicle status.
+ * 2. MEDIA STREAM — Relays live screenshot frames captured from NUI.
+ * 3. REMOTE MODERATION — Relays admin actions (revive, heal, freeze, warn, kick).
+ * 4. INVENTORY INSPECTION — Relays ox_inventory data from FiveM server to admin.
+ * 5. AUDIT LOGGING — Records staff moderation and streaming sessions.
  *
  * @module fivem-watch-server
  */
@@ -39,6 +36,50 @@ const NODE_ENV = process.env.NODE_ENV || 'development';
 const CLIENT_DIST = path.resolve(__dirname, process.env.CLIENT_DIST || path.join('..', 'client', 'dist'));
 const MAX_PLAYERS_PER_INGEST = Number(process.env.MAX_PLAYERS_PER_INGEST || 2048);
 const MAX_FRAME_LENGTH = Number(process.env.MAX_FRAME_LENGTH || 5_000_000);
+
+// ─── Audit Logging Setup (Pilar 1) ─────────────────────────────
+const AUDIT_LOG_FILE = path.join(__dirname, 'logs', 'audit.json');
+const logsDir = path.dirname(AUDIT_LOG_FILE);
+if (!fs.existsSync(logsDir)) {
+  fs.mkdirSync(logsDir, { recursive: true });
+}
+
+let auditLogs = [];
+try {
+  if (fs.existsSync(AUDIT_LOG_FILE)) {
+    auditLogs = JSON.parse(fs.readFileSync(AUDIT_LOG_FILE, 'utf8'));
+  }
+} catch (_e) {
+  auditLogs = [];
+}
+
+function appendAuditLog(entry) {
+  const logItem = {
+    id: 'log_' + Date.now() + '_' + Math.random().toString(36).substring(2, 7),
+    timestamp: new Date().toISOString(),
+    adminName: entry.adminName || 'Admin',
+    category: entry.category || 'general', // 'stream', 'moderation'
+    action: entry.action,
+    targetPlayerId: entry.targetPlayerId,
+    targetPlayerName: entry.targetPlayerName || null,
+    details: entry.details || {},
+  };
+
+  auditLogs.unshift(logItem);
+  if (auditLogs.length > 2000) {
+    auditLogs = auditLogs.slice(0, 2000);
+  }
+
+  // Grava de forma assíncrona os últimos 500 registros
+  fs.writeFile(AUDIT_LOG_FILE, JSON.stringify(auditLogs.slice(0, 500), null, 2), (err) => {
+    if (err) console.error('[fivem-watch] Erro ao salvar audit log:', err.message);
+  });
+
+  // Notifica admins conectados em tempo real
+  for (const adminId of adminSockets) {
+    io.to(adminId).emit('audit_log_entry', logItem);
+  }
+}
 
 function parseCorsOrigin(value) {
   if (value.trim() === '*') return true;
@@ -76,6 +117,8 @@ function normalizePlayer(player) {
   return {
     id,
     name: String(player.name || `Player ${id}`).slice(0, 64),
+    steamName: player.steamName ? String(player.steamName).slice(0, 64) : null,
+    characterName: player.characterName ? String(player.characterName).slice(0, 64) : null,
     ping: Math.max(0, Number(player.ping) || 0),
     x,
     y,
@@ -83,6 +126,9 @@ function normalizePlayer(player) {
     health: Math.max(0, Math.min(200, Number(player.health) || 0)),
     armor: Math.max(0, Math.min(100, Number(player.armor) || 0)),
     heading: ((Number(player.heading) || 0) % 360 + 360) % 360,
+    isFrozen: Boolean(player.isFrozen),
+    dossier: player.dossier && typeof player.dossier === 'object' ? player.dossier : null,
+    vehicle: player.vehicle && typeof player.vehicle === 'object' ? player.vehicle : null,
   };
 }
 
@@ -118,7 +164,6 @@ assertProductionConfig();
 // ─── Express App ───────────────────────────────────────────────
 const app = express();
 
-/** Parse CORS origin — supports wildcard "*" or comma-separated URLs */
 const parsedOrigin = parseCorsOrigin(CORS_ORIGIN);
 
 app.disable('x-powered-by');
@@ -144,34 +189,13 @@ const io = new Server(server, {
 });
 
 // ─── In-Memory State ──────────────────────────────────────────
-/**
- * @typedef {Object} PlayerData
- * @property {number} id       — Server ID of the player
- * @property {string} name     — Player display name
- * @property {number} ping     — Current latency in ms
- * @property {number} x        — World X coordinate
- * @property {number} y        — World Y coordinate
- * @property {number} z        — World Z coordinate
- * @property {number} health   — Player health (0-200)
- * @property {number} armor    — Player armor (0-100)
- * @property {number} heading  — Player heading (0-360)
- */
-
-/** @type {PlayerData[]} Current snapshot of all connected players */
 let playersState = [];
-
-/** @type {Map<string, string>} Map of "fivem player server id" → socket.id for NUI clients */
 const nuiClients = new Map();
-
-/** @type {Set<string>} Set of player server IDs currently being streamed */
 const activeStreams = new Set();
-
-/** @type {Set<string>} Authenticated admin socket IDs */
 const adminSockets = new Set();
-
-/** @type {Map<string, Set<string>>} Map of player server id → set of admin socket IDs watching */
 const streamWatchers = new Map();
 const loginAttempts = new Map();
+let fivemServerSocket = null;
 
 function tooManyLoginAttempts(ip) {
   const now = Date.now();
@@ -186,15 +210,6 @@ function tooManyLoginAttempts(ip) {
 }
 
 // ─── REST Endpoints ───────────────────────────────────────────
-
-/**
- * POST /api/auth/login
- * Authenticates an admin user and returns a simple token.
- *
- * @body {string} username
- * @body {string} password
- * @returns {{ success: boolean, token?: string, error?: string }}
- */
 app.post('/api/auth/login', (req, res) => {
   if (tooManyLoginAttempts(req.ip)) {
     return res.status(429).json({ success: false, error: 'Too many attempts' });
@@ -203,35 +218,72 @@ app.post('/api/auth/login', (req, res) => {
   const { username, password } = req.body;
 
   if (username === ADMIN_USERNAME && password === ADMIN_PASSWORD) {
-    // In production you'd use JWT — for this open-source tool
-    // we use the API_SECRET itself as a simple bearer token
     return res.json({ success: true, token: API_SECRET });
   }
 
   return res.status(401).json({ success: false, error: 'Invalid credentials' });
 });
 
-/**
- * GET /api/health
- * Simple health-check endpoint for monitoring.
- */
 app.get('/api/health', (_req, res) => {
   res.json({
     status: 'ok',
     players: playersState.length,
     streams: activeStreams.size,
     admins: adminSockets.size,
+    fivemConnected: Boolean(fivemServerSocket && fivemServerSocket.connected),
     uptime: process.uptime(),
   });
 });
 
-/**
- * POST /api/ingest
- * Receives player telemetry data from the FiveM server script.
- * Validates the x-api-key header and broadcasts to admin sockets.
- *
- * @body {PlayerData[]} — Array of player data objects
- */
+app.get('/api/audit-logs', (req, res) => {
+  const apiKey = req.headers['x-api-key'] || req.query.token;
+  if (apiKey !== API_SECRET) {
+    return res.status(403).json({ error: 'Invalid API key' });
+  }
+  res.json(auditLogs);
+});
+
+// ─── ox_inventory Item Images Endpoint (Pilar 2) ──────────────
+const OX_IMAGES_DIR = '/home/bases/mri_paulista/resources/[ox]/ox_inventory/web/images';
+let imageCache = new Map();
+
+function refreshImageCache() {
+  try {
+    if (fs.existsSync(OX_IMAGES_DIR)) {
+      const files = fs.readdirSync(OX_IMAGES_DIR);
+      const map = new Map();
+      for (const file of files) {
+        map.set(file.toLowerCase(), file);
+      }
+      imageCache = map;
+      console.log(`[fivem-watch] ✓ Cache de imagens ox_inventory carregado (${files.length} imagens)`);
+    }
+  } catch (err) {
+    console.warn('[fivem-watch] Aviso ao carregar imagens ox_inventory:', err.message);
+  }
+}
+refreshImageCache();
+
+app.get('/api/item-images/:item', (req, res) => {
+  const rawItem = String(req.params.item || '').replace(/\.png$/i, '');
+  const safeItem = path.basename(rawItem);
+  const targetLower = `${safeItem.toLowerCase()}.png`;
+
+  const matchedFile = imageCache.get(targetLower);
+  if (matchedFile) {
+    const filePath = path.join(OX_IMAGES_DIR, matchedFile);
+    return res.sendFile(filePath, { maxAge: '7d' });
+  }
+
+  const directPath = path.join(OX_IMAGES_DIR, `${safeItem}.png`);
+  if (fs.existsSync(directPath)) {
+    return res.sendFile(directPath, { maxAge: '7d' });
+  }
+
+  return res.status(404).end();
+});
+
+
 app.post('/api/ingest', (req, res) => {
   const apiKey = req.headers['x-api-key'];
 
@@ -245,7 +297,6 @@ app.post('/api/ingest', (req, res) => {
   }
 
   playersState = players;
-  // Broadcast to all authenticated admins
   for (const adminId of adminSockets) {
     io.to(adminId).emit('players_update', playersState);
   }
@@ -254,28 +305,20 @@ app.post('/api/ingest', (req, res) => {
 });
 
 // ─── Socket.io Connection Handling ────────────────────────────
-
 io.on('connection', (socket) => {
   const { role, secret, playerId } = socket.handshake.auth;
 
   /**
    * ROLE: "fivem-server"
-   * The FiveM server script connects with this role to push
-   * telemetry data (player list, coords, health, etc.)
    */
   if (role === 'fivem-server' && secret === API_SECRET) {
     console.log(`[fivem-watch] ✓ FiveM server connected (${socket.id})`);
+    fivemServerSocket = socket;
 
-    /**
-     * @event players_update
-     * Receives the full player snapshot from the FiveM server.
-     * @param {PlayerData[]} players — Array of all connected players
-     */
     socket.on('players_update', (players) => {
       const normalized = normalizePlayers(players);
       if (!normalized) return;
       playersState = normalized;
-      // Broadcast to all authenticated admins
       for (const adminId of adminSockets) {
         io.to(adminId).emit('players_update', playersState);
       }
@@ -283,8 +326,10 @@ io.on('connection', (socket) => {
 
     socket.on('disconnect', () => {
       console.log(`[fivem-watch] ✗ FiveM server disconnected`);
+      if (fivemServerSocket?.id === socket.id) {
+        fivemServerSocket = null;
+      }
       playersState = [];
-      // Notify admins the server went offline
       for (const adminId of adminSockets) {
         io.to(adminId).emit('server_offline');
       }
@@ -295,8 +340,6 @@ io.on('connection', (socket) => {
 
   /**
    * ROLE: "fivem-nui"
-   * A player's hidden NUI browser connects with this role to
-   * send live screenshot frames when an admin requests streaming.
    */
   if (role === 'fivem-nui' && secret === API_SECRET && playerId) {
     const pid = String(playerId);
@@ -307,15 +350,8 @@ io.on('connection', (socket) => {
     nuiClients.set(pid, socket.id);
     console.log(`[fivem-watch] ✓ NUI client connected for player #${pid} (${socket.id})`);
 
-    /**
-     * @event frame
-     * Receives a single WebP frame data URL from the player's NUI.
-     * Relays it ONLY to admin sockets that are watching this player.
-     * @param {string} data — Base64-encoded WebP data URL
-     */
     socket.on('frame', (data) => {
       if (!isValidFrame(data)) return;
-      // DEBUG: console.log(`[fivem-watch] Frame received from #${pid}, length: ${data?.length || 0}`);
       const watchers = streamWatchers.get(pid);
       if (watchers) {
         for (const adminId of watchers) {
@@ -336,21 +372,15 @@ io.on('connection', (socket) => {
 
   /**
    * ROLE: "admin"
-   * Dashboard users connect with this role to view players
-   * on the map and request live screen streams.
    */
   if (role === 'admin' && secret === API_SECRET) {
     adminSockets.add(socket.id);
     console.log(`[fivem-watch] ✓ Admin connected (${socket.id})`);
 
-    // Send current state immediately upon connection
     socket.emit('players_update', playersState);
+    socket.emit('audit_logs_init', auditLogs.slice(0, 100));
 
-    /**
-     * @event start_stream
-     * Admin requests to start watching a specific player's screen.
-     * @param {string|number} targetPlayerId — Server ID of the player to watch
-     */
+    // Início de Stream (Pilar 1)
     socket.on('start_stream', (targetPlayerId) => {
       const pid = String(targetPlayerId);
       if (!isValidPlayerId(pid)) return;
@@ -361,26 +391,29 @@ io.on('connection', (socket) => {
         return;
       }
 
-      // Register this admin as a watcher
       if (!streamWatchers.has(pid)) {
         streamWatchers.set(pid, new Set());
       }
       streamWatchers.get(pid).add(socket.id);
 
-      // If not already streaming, tell the NUI to start capturing
       if (!activeStreams.has(pid)) {
         activeStreams.add(pid);
         io.to(nuiSocketId).emit('start_capture');
         console.log(`[fivem-watch] ▶ Stream started for player #${pid}`);
       }
 
+      const player = playersState.find((p) => p.id === Number(pid));
+      appendAuditLog({
+        adminName: 'Admin',
+        category: 'stream',
+        action: 'start_stream',
+        targetPlayerId: Number(pid),
+        targetPlayerName: player?.name,
+      });
+
       socket.emit('stream_started', { playerId: pid });
     });
 
-    /**
-     * @event update_stream_config
-     * Relays dynamic stream settings (FPS, Quality, Scale) to the NUI.
-     */
     socket.on('update_stream_config', (data) => {
       const { playerId, config } = data;
       const pid = String(playerId);
@@ -393,12 +426,6 @@ io.on('connection', (socket) => {
       }
     });
 
-    /**
-     * @event stop_stream
-     * Admin stops watching a specific player's screen.
-     * If no other admin is watching, the NUI capture loop stops.
-     * @param {string|number} targetPlayerId
-     */
     socket.on('stop_stream', (targetPlayerId) => {
       const pid = String(targetPlayerId);
       if (!isValidPlayerId(pid)) return;
@@ -407,7 +434,6 @@ io.on('connection', (socket) => {
       if (watchers) {
         watchers.delete(socket.id);
 
-        // If no one is watching anymore, stop the NUI capture
         if (watchers.size === 0) {
           streamWatchers.delete(pid);
           activeStreams.delete(pid);
@@ -420,13 +446,66 @@ io.on('connection', (socket) => {
         }
       }
 
+      const player = playersState.find((p) => p.id === Number(pid));
+      appendAuditLog({
+        adminName: 'Admin',
+        category: 'stream',
+        action: 'stop_stream',
+        targetPlayerId: Number(pid),
+        targetPlayerName: player?.name,
+      });
+
       socket.emit('stream_stopped', { playerId: pid });
+    });
+
+    // ─── RPC: Consulta de Inventário (Pilar 2) ──────────────────
+    socket.on('get_player_inventory', (data, callback) => {
+      const pid = data?.playerId;
+      if (!fivemServerSocket || !fivemServerSocket.connected) {
+        if (typeof callback === 'function') callback({ success: false, error: 'Servidor FiveM desconectado.' });
+        return;
+      }
+
+      fivemServerSocket.emit('get_player_inventory', { playerId: pid }, (response) => {
+        if (typeof callback === 'function') callback(response);
+      });
+    });
+
+    // ─── RPC: Ações Administrativas Remotas (Pilar 3) ────────────
+    socket.on('admin_action', (data, callback) => {
+      if (!fivemServerSocket || !fivemServerSocket.connected) {
+        if (typeof callback === 'function') callback({ success: false, error: 'Servidor FiveM desconectado.' });
+        return;
+      }
+
+      const targetId = Number(data?.targetPlayerId);
+      const player = playersState.find((p) => p.id === targetId);
+
+      fivemServerSocket.emit('admin_action', data, (response) => {
+        appendAuditLog({
+          adminName: data?.adminName || 'Admin',
+          category: 'moderation',
+          action: data?.action,
+          targetPlayerId: targetId,
+          targetPlayerName: player?.name || `Player ${targetId}`,
+          details: {
+            options: data?.options || {},
+            success: Boolean(response?.success),
+            result: response?.message || response?.error || 'Ação registrada.',
+          },
+        });
+        if (typeof callback === 'function') callback(response);
+      });
+    });
+
+    // ─── RPC: Histórico de Auditoria (Pilar 1) ───────────────────
+    socket.on('get_audit_logs', (callback) => {
+      if (typeof callback === 'function') callback(auditLogs);
     });
 
     socket.on('disconnect', () => {
       adminSockets.delete(socket.id);
 
-      // Clean up any streams this admin was watching
       for (const [pid, watchers] of streamWatchers.entries()) {
         watchers.delete(socket.id);
         if (watchers.size === 0) {
@@ -447,8 +526,7 @@ io.on('connection', (socket) => {
     return;
   }
 
-  // Unauthorized connection — reject
-  console.log(`[fivem-watch] ✗ Unauthorized connection rejected (${socket.id}): role=${role}, secretMatch=${secret === API_SECRET}, playerId=${playerId}`);
+  console.log(`[fivem-watch] ✗ Unauthorized connection rejected (${socket.id}): role=${role}`);
   socket.emit('auth_error', { error: 'Invalid role or secret' });
   socket.disconnect(true);
 });
