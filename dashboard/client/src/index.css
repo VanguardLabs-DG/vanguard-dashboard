@@ -1743,8 +1743,8 @@ body {
 }
 
 .audit-action-badge.teleport {
-  background: rgba(168, 85, 247, 0.15);
-  color: #c084fc;
+  background: rgba(56, 189, 248, 0.15);
+  color: #38bdf8;
 }
 
 .audit-cell-target {

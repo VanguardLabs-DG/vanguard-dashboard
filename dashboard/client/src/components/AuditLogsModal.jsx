@@ -5,10 +5,12 @@
  * - Histórico de quem telou quem, horário, duração e ações executadas
  * - Auditoria de comandos administrativos (freeze, revive, heal, warn, kick)
  *
+ * Totalmente blindado contra dados nulos, malformados ou incompatibilidades de navegador.
+ *
  * @module AuditLogsModal
  */
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { motion as Motion } from 'framer-motion';
 import {
   X,
@@ -28,13 +30,76 @@ import {
 } from '@phosphor-icons/react';
 import { getSocket } from '../socket';
 
+/**
+ * Converte com segurança qualquer valor para exibição em texto sem quebrar o JSX.
+ */
+function safeText(val) {
+  if (val === null || val === undefined) return '';
+  if (typeof val === 'string' || typeof val === 'number') return String(val);
+  if (typeof val === 'boolean') return val ? 'Sim' : 'Não';
+  try {
+    return JSON.stringify(val);
+  } catch (_e) {
+    return String(val);
+  }
+}
+
+/**
+ * Formata coordenadas com segurança, suportando {x,y,z}, {X,Y,Z} ou [x,y,z].
+ */
+function formatCoords(coords) {
+  if (!coords) return null;
+  let x, y, z;
+  if (Array.isArray(coords)) {
+    [x, y, z] = coords;
+  } else if (typeof coords === 'object') {
+    x = coords.x !== undefined ? coords.x : coords.X;
+    y = coords.y !== undefined ? coords.y : coords.Y;
+    z = coords.z !== undefined ? coords.z : coords.Z;
+  }
+  const nx = Number(x);
+  const ny = Number(y);
+  const nz = Number(z);
+  if (Number.isFinite(nx) && Number.isFinite(ny) && Number.isFinite(nz)) {
+    return `[${nx.toFixed(1)}, ${ny.toFixed(1)}, ${nz.toFixed(1)}]`;
+  }
+  return null;
+}
+
+/**
+ * Converte timestamp em string legível sem disparar RangeError em navegadores estritos.
+ */
+function safeDate(timestamp) {
+  if (!timestamp) {
+    return { timeStr: '--:--:--', dateStr: '--/--' };
+  }
+  try {
+    const d = new Date(timestamp);
+    if (isNaN(d.getTime())) {
+      return { timeStr: '--:--:--', dateStr: '--/--' };
+    }
+    const timeStr = d.toLocaleTimeString('pt-BR', {
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+    });
+    const dateStr = d.toLocaleDateString('pt-BR', {
+      day: '2-digit',
+      month: '2-digit',
+    });
+    return { timeStr, dateStr };
+  } catch (_e) {
+    return { timeStr: '--:--:--', dateStr: '--/--' };
+  }
+}
+
 export default function AuditLogsModal({ onClose }) {
   const [logs, setLogs] = useState([]);
   const [loading, setLoading] = useState(false);
   const [filterCategory, setFilterCategory] = useState('all'); // 'all' | 'stream' | 'moderation'
   const [searchQuery, setSearchQuery] = useState('');
 
-  const fetchLogs = () => {
+  const fetchLogs = useCallback(() => {
     setLoading(true);
     const socket = getSocket();
     if (!socket) {
@@ -42,13 +107,19 @@ export default function AuditLogsModal({ onClose }) {
       return;
     }
 
-    socket.emit('get_audit_logs', (data) => {
+    try {
+      socket.emit('get_audit_logs', (data) => {
+        setLoading(false);
+        if (Array.isArray(data)) {
+          // Filtra elementos inválidos
+          setLogs(data.filter((item) => item && typeof item === 'object'));
+        }
+      });
+    } catch (err) {
+      console.error('[AuditLogsModal] Erro ao buscar logs:', err);
       setLoading(false);
-      if (Array.isArray(data)) {
-        setLogs(data);
-      }
-    });
-  };
+    }
+  }, []);
 
   useEffect(() => {
     fetchLogs();
@@ -57,7 +128,11 @@ export default function AuditLogsModal({ onClose }) {
     if (!socket) return;
 
     const handleNewEntry = (entry) => {
-      setLogs((prev) => [entry, ...prev.filter((l) => l.id !== entry.id)]);
+      if (!entry || typeof entry !== 'object') return;
+      setLogs((prev) => {
+        const entryId = entry.id || `log_${Date.now()}`;
+        return [entry, ...prev.filter((l) => l && l.id !== entryId)];
+      });
     };
 
     socket.on('audit_log_entry', handleNewEntry);
@@ -65,7 +140,7 @@ export default function AuditLogsModal({ onClose }) {
     return () => {
       socket.off('audit_log_entry', handleNewEntry);
     };
-  }, []);
+  }, [fetchLogs]);
 
   const getActionBadge = (action) => {
     switch (action) {
@@ -118,17 +193,29 @@ export default function AuditLogsModal({ onClose }) {
           </span>
         );
       default:
-        return <span className="audit-action-badge default">{action}</span>;
+        return <span className="audit-action-badge default">{safeText(action)}</span>;
     }
   };
 
   const filteredLogs = logs.filter((log) => {
+    if (!log || typeof log !== 'object') return false;
     if (filterCategory !== 'all' && log.category !== filterCategory) {
       return false;
     }
-    const q = searchQuery.toLowerCase();
-    const str = `${log.action} ${log.adminName} ${log.targetPlayerId} ${log.targetPlayerName || ''} ${JSON.stringify(log.details || '')}`.toLowerCase();
-    return str.includes(q);
+    const q = (searchQuery || '').trim().toLowerCase();
+    if (!q) return true;
+
+    try {
+      const action = String(log.action || '');
+      const admin = String(log.adminName || '');
+      const pid = String(log.targetPlayerId || '');
+      const pname = String(log.targetPlayerName || '');
+      const details = log.details ? JSON.stringify(log.details) : '';
+      const str = `${action} ${admin} ${pid} ${pname} ${details}`.toLowerCase();
+      return str.includes(q);
+    } catch (_e) {
+      return true;
+    }
   });
 
   return (
@@ -224,20 +311,13 @@ export default function AuditLogsModal({ onClose }) {
             </div>
           ) : (
             <div className="audit-table">
-              {filteredLogs.map((log) => {
-                const date = new Date(log.timestamp);
-                const timeStr = date.toLocaleTimeString('pt-BR', {
-                  hour: '2-digit',
-                  minute: '2-digit',
-                  second: '2-digit',
-                });
-                const dateStr = date.toLocaleDateString('pt-BR', {
-                  day: '2-digit',
-                  month: '2-digit',
-                });
+              {filteredLogs.map((log, index) => {
+                const { timeStr, dateStr } = safeDate(log.timestamp);
+                const coordsFormatted = formatCoords(log.details?.options?.coords);
+                const logKey = log.id || `audit_idx_${index}_${log.timestamp || ''}`;
 
                 return (
-                  <div key={log.id} className="audit-row">
+                  <div key={logKey} className="audit-row">
                     <div className="audit-cell-time font-mono">
                       <Clock size={14} className="text-muted" />
                       <span>{timeStr}</span>
@@ -246,7 +326,7 @@ export default function AuditLogsModal({ onClose }) {
 
                     <div className="audit-cell-admin">
                       <User size={14} className="text-secondary" />
-                      <span className="admin-name">{log.adminName}</span>
+                      <span className="admin-name">{safeText(log.adminName) || 'Admin'}</span>
                     </div>
 
                     <div className="audit-cell-action">
@@ -254,28 +334,26 @@ export default function AuditLogsModal({ onClose }) {
                     </div>
 
                     <div className="audit-cell-target">
-                      <span className="target-id font-mono">#{log.targetPlayerId}</span>
+                      <span className="target-id font-mono">
+                        #{safeText(log.targetPlayerId) || '?'}
+                      </span>
                       <span className="target-name">
-                        {log.targetPlayerName || `Player ${log.targetPlayerId}`}
+                        {safeText(log.targetPlayerName) || `Player ${safeText(log.targetPlayerId)}`}
                       </span>
                     </div>
 
                     <div className="audit-cell-details text-secondary font-mono">
                       {log.details?.options?.reason && (
-                        <span>Motivo: "{log.details.options.reason}"</span>
+                        <span>Motivo: "{safeText(log.details.options.reason)}"</span>
                       )}
                       {log.details?.options?.message && (
-                        <span>Aviso: "{log.details.options.message}"</span>
+                        <span>Aviso: "{safeText(log.details.options.message)}"</span>
                       )}
-                      {log.details?.options?.coords && (
-                        <span>
-                          Coords: [{log.details.options.coords.x.toFixed(1)},{' '}
-                          {log.details.options.coords.y.toFixed(1)},{' '}
-                          {log.details.options.coords.z.toFixed(1)}]
-                        </span>
+                      {coordsFormatted && (
+                        <span>Coords: {coordsFormatted}</span>
                       )}
                       {log.details?.result && (
-                        <span className="text-muted">({log.details.result})</span>
+                        <span className="text-muted">({safeText(log.details.result)})</span>
                       )}
                     </div>
                   </div>

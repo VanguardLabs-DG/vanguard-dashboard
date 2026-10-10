@@ -1,0 +1,66 @@
+[
+  {
+    "username": "dege",
+    "displayName": "Dege",
+    "role": "superadmin",
+    "salt": "153a39557738b8d81428b1d09f2101bb",
+    "passwordHash": "8e130286856a8afed8b76babc2fd9935262a01382ac9cabbbe0f7f8378403b52e074a0619a6980a617bfe985f63a6ac81bba3e8ccb0cd9146c5c40e65aea834a",
+    "mustChangePassword": false,
+    "createdAt": "2026-10-06T00:20:18.553Z",
+    "lastLogin": "2026-10-06T16:17:28.754Z",
+    "passwordUpdatedAt": "2026-10-06T01:05:55.164Z"
+  },
+  {
+    "username": "isa",
+    "displayName": "Isa",
+    "role": "admin",
+    "salt": "82f6baa46ed9f11386aba46e3f5a029b",
+    "passwordHash": "e9d269271dfa3c6c5f752ef68cd3fdfaf2fa887339e742f33c782fb7fb42657d0ac89fedb49d52318762ad66ee070f203cf78362e80b6ca9d809411ad32a8473",
+    "mustChangePassword": false,
+    "createdAt": "2026-10-06T00:20:18.595Z",
+    "lastLogin": "2026-10-06T02:27:06.730Z",
+    "passwordUpdatedAt": "2026-10-06T02:23:19.545Z"
+  },
+  {
+    "username": "mimy",
+    "displayName": "Mimy",
+    "role": "admin",
+    "salt": "9480e22790bc1719c57506007849d1ce",
+    "passwordHash": "97113cc952f336103de452bd8c98a4ef8ef873aefbd0884ebcc23c304c19e6e3ed2fcf0ef7ca4034329113e026c4047e2f3810f036338948f6fb04b155b53a9f",
+    "mustChangePassword": true,
+    "createdAt": "2026-10-06T00:20:18.630Z",
+    "lastLogin": "2026-10-06T00:27:48.214Z"
+  },
+  {
+    "username": "berlim",
+    "displayName": "Berlim",
+    "role": "admin",
+    "salt": "bf8abfd331d14604aba87d3fbac6a26f",
+    "passwordHash": "36e7bf27e6c31ceed8d0379443f08832cc51cd00ef65c18184737d7e50b75004f871e633267b387d93ce490c2f24796c1df0a8db1e4e02b4d0fcc1a79557a440",
+    "mustChangePassword": false,
+    "createdAt": "2026-10-06T00:20:18.665Z",
+    "lastLogin": "2026-10-06T02:25:48.721Z",
+    "passwordUpdatedAt": "2026-10-06T02:25:54.794Z"
+  },
+  {
+    "username": "baya",
+    "displayName": "Baya",
+    "role": "admin",
+    "salt": "6e00a4cd8fa9f9551197f115769fa0ab",
+    "passwordHash": "3eaba3f88ffbff3dbff82d460c0d034098c1329517a9d78749a401e1c836944c0b0cf342c78b53633c75811c60553249c044aeb8bb08c15e818bacaf231570a5",
+    "mustChangePassword": true,
+    "createdAt": "2026-10-06T00:20:18.708Z",
+    "lastLogin": "2026-10-06T00:27:48.560Z"
+  },
+  {
+    "username": "morgan",
+    "displayName": "Morgan",
+    "role": "admin",
+    "salt": "2b2217a574640c44d6ed889cb3fcdf13",
+    "passwordHash": "483342f4e5c377df1d9e92f3011f3aa618f55e4be6b0c99a0f78647586cc814795d4389129d9b47053abd400a307cde82d3ee5d7528cf7e6dfcecd65b92085e2",
+    "mustChangePassword": true,
+    "createdAt": "2026-10-06T00:20:18.742Z",
+    "lastLogin": "2026-10-06T00:27:48.648Z",
+    "passwordUpdatedAt": "2026-10-06T00:27:58.748Z"
+  }
+]

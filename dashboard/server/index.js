@@ -23,6 +23,7 @@ const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
 const path = require('path');
+const auth = require('./auth');
 
 // ─── Configuration ─────────────────────────────────────────────
 const DEFAULT_SECRET = 'CHANGE_ME_TO_A_RANDOM_SECRET';
@@ -47,22 +48,64 @@ if (!fs.existsSync(logsDir)) {
 let auditLogs = [];
 try {
   if (fs.existsSync(AUDIT_LOG_FILE)) {
-    auditLogs = JSON.parse(fs.readFileSync(AUDIT_LOG_FILE, 'utf8'));
+    const raw = JSON.parse(fs.readFileSync(AUDIT_LOG_FILE, 'utf8'));
+    if (Array.isArray(raw)) {
+      auditLogs = raw.filter((item) => item && typeof item === 'object');
+    }
   }
 } catch (_e) {
   auditLogs = [];
 }
 
+function sanitizeDetails(details) {
+  if (!details || typeof details !== 'object') return {};
+  const clean = {
+    options: {},
+    success: Boolean(details.success),
+    result: typeof details.result === 'string'
+      ? details.result
+      : (details.result ? JSON.stringify(details.result) : 'Ação registrada.'),
+  };
+
+  if (details.options && typeof details.options === 'object') {
+    const opts = details.options;
+    if (opts.reason) clean.options.reason = String(opts.reason).slice(0, 255);
+    if (opts.message) clean.options.message = String(opts.message).slice(0, 255);
+    if (opts.toggle !== undefined) clean.options.toggle = Boolean(opts.toggle);
+
+    if (opts.coords) {
+      let x, y, z;
+      if (Array.isArray(opts.coords)) {
+        [x, y, z] = opts.coords;
+      } else if (typeof opts.coords === 'object') {
+        x = opts.coords.x !== undefined ? opts.coords.x : opts.coords.X;
+        y = opts.coords.y !== undefined ? opts.coords.y : opts.coords.Y;
+        z = opts.coords.z !== undefined ? opts.coords.z : opts.coords.Z;
+      }
+      const nx = Number(x);
+      const ny = Number(y);
+      const nz = Number(z);
+      if (Number.isFinite(nx) && Number.isFinite(ny) && Number.isFinite(nz)) {
+        clean.options.coords = { x: nx, y: ny, z: nz };
+      }
+    }
+  }
+
+  return clean;
+}
+
 function appendAuditLog(entry) {
+  if (!entry || typeof entry !== 'object') return;
+
   const logItem = {
     id: 'log_' + Date.now() + '_' + Math.random().toString(36).substring(2, 7),
     timestamp: new Date().toISOString(),
-    adminName: entry.adminName || 'Admin',
-    category: entry.category || 'general', // 'stream', 'moderation'
-    action: entry.action,
-    targetPlayerId: entry.targetPlayerId,
-    targetPlayerName: entry.targetPlayerName || null,
-    details: entry.details || {},
+    adminName: String(entry.adminName || 'Admin').slice(0, 64),
+    category: ['stream', 'moderation', 'general'].includes(entry.category) ? entry.category : 'general',
+    action: String(entry.action || 'action').slice(0, 64),
+    targetPlayerId: Number.isInteger(Number(entry.targetPlayerId)) ? Number(entry.targetPlayerId) : null,
+    targetPlayerName: entry.targetPlayerName ? String(entry.targetPlayerName).slice(0, 64) : null,
+    details: sanitizeDetails(entry.details),
   };
 
   auditLogs.unshift(logItem);
@@ -212,16 +255,105 @@ function tooManyLoginAttempts(ip) {
 // ─── REST Endpoints ───────────────────────────────────────────
 app.post('/api/auth/login', (req, res) => {
   if (tooManyLoginAttempts(req.ip)) {
-    return res.status(429).json({ success: false, error: 'Too many attempts' });
+    return res.status(429).json({ success: false, error: 'Muitas tentativas de login. Aguarde 1 minuto.' });
   }
 
-  const { username, password } = req.body;
+  const { username, password } = req.body || {};
+  if (!username || !password) {
+    return res.status(400).json({ success: false, error: 'Usuário e senha são obrigatórios.' });
+  }
 
+  const result = auth.authenticate(username, password, API_SECRET);
+  if (result) {
+    return res.json({
+      success: true,
+      token: result.token,
+      user: result.user,
+    });
+  }
+
+  // Fallback para ADMIN_USERNAME / ADMIN_PASSWORD do .env
   if (username === ADMIN_USERNAME && password === ADMIN_PASSWORD) {
-    return res.json({ success: true, token: API_SECRET });
+    const masterUser = {
+      username: ADMIN_USERNAME,
+      displayName: 'Dege (Master)',
+      role: 'superadmin',
+      mustChangePassword: false,
+    };
+    const token = auth.createSessionToken(masterUser, API_SECRET);
+    return res.json({
+      success: true,
+      token,
+      user: masterUser,
+    });
   }
 
-  return res.status(401).json({ success: false, error: 'Invalid credentials' });
+  return res.status(401).json({ success: false, error: 'Usuário ou senha incorretos.' });
+});
+
+app.post('/api/auth/change-password', (req, res) => {
+  const authHeader = req.headers.authorization || req.headers['x-api-key'];
+  const token = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : authHeader;
+  const session = auth.verifySessionToken(token, API_SECRET);
+
+  if (!session) {
+    return res.status(401).json({ success: false, error: 'Sessão inválida ou expirada.' });
+  }
+
+  const { newPassword } = req.body || {};
+  if (!newPassword || typeof newPassword !== 'string' || newPassword.length < 6) {
+    return res.status(400).json({ success: false, error: 'A nova senha deve ter no mínimo 6 caracteres.' });
+  }
+
+  const ok = auth.changePassword(session.username, newPassword);
+  if (!ok) {
+    return res.status(400).json({ success: false, error: 'Não foi possível alterar a senha.' });
+  }
+
+  // Emite novo token com mustChangePassword = false
+  const updatedUser = {
+    username: session.username,
+    displayName: session.displayName,
+    role: session.role,
+    mustChangePassword: false,
+  };
+  const newToken = auth.createSessionToken(updatedUser, API_SECRET);
+
+  return res.json({ success: true, token: newToken, user: updatedUser });
+});
+
+app.get('/api/auth/staff', (req, res) => {
+  const authHeader = req.headers.authorization || req.headers['x-api-key'];
+  const token = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : authHeader;
+  const session = auth.verifySessionToken(token, API_SECRET);
+
+  if (!session || session.role !== 'superadmin') {
+    return res.status(403).json({ success: false, error: 'Acesso restrito ao SuperAdmin.' });
+  }
+
+  return res.json({ success: true, staff: auth.getStaffList() });
+});
+
+app.post('/api/auth/staff/reset-password', (req, res) => {
+  const authHeader = req.headers.authorization || req.headers['x-api-key'];
+  const token = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : authHeader;
+  const session = auth.verifySessionToken(token, API_SECRET);
+
+  if (!session || session.role !== 'superadmin') {
+    return res.status(403).json({ success: false, error: 'Acesso restrito ao SuperAdmin.' });
+  }
+
+  const { username } = req.body || {};
+  if (!username) {
+    return res.status(400).json({ success: false, error: 'Nome de usuário não informado.' });
+  }
+
+  const ok = auth.resetUserPassword(username);
+  if (!ok) {
+    return res.status(404).json({ success: false, error: 'Usuário não encontrado.' });
+  }
+
+  return res.json({ success: true, message: `Senha de ${username} resetada com sucesso para 'vanguard@2026'.` });
 });
 
 app.get('/api/health', (_req, res) => {
@@ -373,9 +505,11 @@ io.on('connection', (socket) => {
   /**
    * ROLE: "admin"
    */
-  if (role === 'admin' && secret === API_SECRET) {
+  const verifiedUser = auth.verifySessionToken(secret, API_SECRET);
+  if (role === 'admin' && verifiedUser && !verifiedUser.isMasterKey) {
+    socket.user = verifiedUser;
     adminSockets.add(socket.id);
-    console.log(`[fivem-watch] ✓ Admin connected (${socket.id})`);
+    console.log(`[fivem-watch] ✓ Staff connected: ${socket.user.displayName} (${socket.user.role}) [${socket.id}]`);
 
     socket.emit('players_update', playersState);
     socket.emit('audit_logs_init', auditLogs.slice(0, 100));
@@ -399,12 +533,12 @@ io.on('connection', (socket) => {
       if (!activeStreams.has(pid)) {
         activeStreams.add(pid);
         io.to(nuiSocketId).emit('start_capture');
-        console.log(`[fivem-watch] ▶ Stream started for player #${pid}`);
+        console.log(`[fivem-watch] ▶ Stream started for player #${pid} by ${socket.user.displayName}`);
       }
 
       const player = playersState.find((p) => p.id === Number(pid));
       appendAuditLog({
-        adminName: 'Admin',
+        adminName: socket.user.displayName,
         category: 'stream',
         action: 'start_stream',
         targetPlayerId: Number(pid),
@@ -448,7 +582,7 @@ io.on('connection', (socket) => {
 
       const player = playersState.find((p) => p.id === Number(pid));
       appendAuditLog({
-        adminName: 'Admin',
+        adminName: socket.user.displayName,
         category: 'stream',
         action: 'stop_stream',
         targetPlayerId: Number(pid),
@@ -480,10 +614,16 @@ io.on('connection', (socket) => {
 
       const targetId = Number(data?.targetPlayerId);
       const player = playersState.find((p) => p.id === targetId);
+      const staffName = socket.user?.displayName || 'Admin';
 
-      fivemServerSocket.emit('admin_action', data, (response) => {
+      const forwardData = {
+        ...data,
+        adminName: staffName,
+      };
+
+      fivemServerSocket.emit('admin_action', forwardData, (response) => {
         appendAuditLog({
-          adminName: data?.adminName || 'Admin',
+          adminName: staffName,
           category: 'moderation',
           action: data?.action,
           targetPlayerId: targetId,
@@ -532,9 +672,24 @@ io.on('connection', (socket) => {
 });
 
 if (NODE_ENV === 'production' && fs.existsSync(path.join(CLIENT_DIST, 'index.html'))) {
-  app.use(express.static(CLIENT_DIST, { index: false, maxAge: '1h' }));
+  app.use(express.static(CLIENT_DIST, {
+    index: false,
+    setHeaders: (res, filePath) => {
+      if (filePath.endsWith('index.html')) {
+        res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+        res.setHeader('Pragma', 'no-cache');
+        res.setHeader('Expires', '0');
+      } else {
+        res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+      }
+    },
+  }));
+
   app.get('*', (req, res, next) => {
     if (req.path.startsWith('/api/')) return next();
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
     res.sendFile(path.join(CLIENT_DIST, 'index.html'));
   });
 } else if (NODE_ENV === 'production') {
