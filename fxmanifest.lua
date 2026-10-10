@@ -32,10 +32,10 @@ server_scripts {
   'server/main.js'
 }
 
--- Client-side script (NUI bridge)
+-- Client-side script (NUI bridge em Lua 5.4 - 0.00ms resmon)
 client_scripts {
-  'config.js',
-  'client/main.js'
+  'config.lua',
+  'client/main.lua'
 }
 
 -- Hidden NUI page (WebGL screenshot + Socket.io)

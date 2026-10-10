@@ -51,7 +51,10 @@ let rawCanvas, rawCtx;
 let outputCanvas, outputCtx;
 let captureRequestPending = false;
 let captureIntervalTimer = null;
-let animateStarted = false;
+let animationFrameId = null;
+let cachedPixelBuffer = null;
+let cachedBufferLength = 0;
+let cachedImageData = null;
 
 function getNativeWidth() {
   return window.innerWidth || (window.screen && window.screen.width) || 1920;
@@ -142,7 +145,7 @@ function init() {
   // 2D Canvases
   if (!rawCanvas) {
     rawCanvas = document.createElement('canvas');
-    rawCtx = rawCanvas.getContext('2d', { willReadFrequently: true });
+    rawCtx = rawCanvas.getContext('2d');
   }
   if (!outputCanvas) {
     outputCanvas = document.createElement('canvas');
@@ -152,11 +155,7 @@ function init() {
   window.removeEventListener('resize', handleWindowResize);
   window.addEventListener('resize', handleWindowResize);
 
-  console.log('[vanguard_dashboard] Engine initialized at native resolution:', rw, 'x', rh);
-  if (!animateStarted) {
-    animateStarted = true;
-    animate();
-  }
+  console.log('[vanguard_dashboard] Engine initialized in standby (0.00ms idle mode):', rw, 'x', rh);
 }
 
 function handleWindowResize() {
@@ -196,15 +195,19 @@ function handleWindowResize() {
 }
 
 function animate() {
-  requestAnimationFrame(animate);
-
-  if (renderer && sceneRTT && cameraRTT && rtTexture) {
-    renderer.clear();
-    renderer.render(sceneRTT, cameraRTT, rtTexture, true);
+  if (!isCapturing) {
+    animationFrameId = null;
+    return;
   }
+
+  animationFrameId = requestAnimationFrame(animate);
 
   if (captureRequestPending) {
     captureRequestPending = false;
+    if (renderer && sceneRTT && cameraRTT && rtTexture) {
+      renderer.clear();
+      renderer.render(sceneRTT, cameraRTT, rtTexture, true);
+    }
     processCapture();
   }
 }
@@ -214,25 +217,27 @@ function processCapture() {
 
   const nativeW = rtTexture.width;
   const nativeH = rtTexture.height;
+  const requiredBytes = nativeW * nativeH * 4;
 
-  // Read raw pixels
-  const read = new Uint8Array(nativeW * nativeH * 4);
-  renderer.readRenderTargetPixels(rtTexture, 0, 0, nativeW, nativeH, read);
-
-  // Guarantee alpha channel is 255 (completely opaque)
-  const d = new Uint8ClampedArray(read.buffer);
-  for (let i = 3; i < d.length; i += 4) {
-    d[i] = 255;
+  // Reutiliza buffer para zerar garbage collection churn (evita alocar 10GB/min)
+  if (!cachedPixelBuffer || cachedBufferLength !== requiredBytes) {
+    cachedBufferLength = requiredBytes;
+    cachedPixelBuffer = new Uint8Array(requiredBytes);
+    cachedImageData = new ImageData(nativeW, nativeH);
   }
 
-  // Draw into native raw staging canvas
+  renderer.readRenderTargetPixels(rtTexture, 0, 0, nativeW, nativeH, cachedPixelBuffer);
+
+  // Copia direta dos pixels para o ImageData sem alocações repetidas por frame
+  cachedImageData.data.set(cachedPixelBuffer);
+
   if (rawCanvas.width !== nativeW || rawCanvas.height !== nativeH) {
     rawCanvas.width = nativeW;
     rawCanvas.height = nativeH;
   }
-  rawCtx.putImageData(new ImageData(d, nativeW, nativeH), 0, 0);
+  rawCtx.putImageData(cachedImageData, 0, 0);
 
-  // Smoothly downscale into outputCanvas for network streaming
+  // Downscale suave no outputCanvas para streaming de rede
   const scale = Math.max(0.1, Math.min(1.0, config.resolutionScale || 0.4));
   const scaledW = Math.max(160, Math.floor(nativeW * scale));
   const scaledH = Math.max(120, Math.floor(nativeH * scale));
@@ -253,9 +258,12 @@ window.addEventListener('message', (event) => {
   if (!msg) return;
   console.log('[vanguard_dashboard NUI] Mensagem recebida:', msg.type);
   if (msg.type === 'init') {
-    const isSameTarget = socket && socket.connected && config.backendUrl === msg.backendUrl && String(config.playerId) === String(msg.playerId);
+    const isSameTarget = socket && config.backendUrl === msg.backendUrl && String(config.playerId) === String(msg.playerId);
     Object.assign(config, msg);
-    if (isSameTarget) return;
+    if (isSameTarget) {
+      // Já inicializado com mesmo target; Socket.io gerencia reconexão automaticamente
+      return;
+    }
 
     if (socket) {
       try { socket.disconnect(); } catch (_e) {}
@@ -326,25 +334,34 @@ function connectToBackend() {
 function startCapture() {
   if (isCapturing) return;
   isCapturing = true;
-  blackFrameCount = 0;
 
   if (gameTexture) gameTexture.needsUpdate = true;
   if (material) material.needsUpdate = true;
 
-  const interval = Math.floor(1000 / config.streamFps);
+  const interval = Math.floor(1000 / Math.max(1, config.streamFps || 20));
   captureIntervalTimer = setInterval(() => {
     captureRequestPending = true;
   }, interval);
-  
+
+  if (!animationFrameId) {
+    animationFrameId = requestAnimationFrame(animate);
+  }
+
   console.log(`[vanguard_dashboard] Capture started at ${config.streamFps} FPS`);
 }
 
 function stopCapture() {
   isCapturing = false;
+  captureRequestPending = false;
   if (captureIntervalTimer) {
     clearInterval(captureIntervalTimer);
     captureIntervalTimer = null;
   }
+  if (animationFrameId) {
+    cancelAnimationFrame(animationFrameId);
+    animationFrameId = null;
+  }
+  console.log('[vanguard_dashboard] Capture stopped (Three.js WebGL paused)');
 }
 
 // Start graphics engine

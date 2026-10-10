@@ -240,6 +240,16 @@ const streamWatchers = new Map();
 const loginAttempts = new Map();
 let fivemServerSocket = null;
 
+// Limpeza periódica a cada 5 minutos para evitar vazamento de memória em loginAttempts
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, state] of loginAttempts.entries()) {
+    if (state.resetAt < now) {
+      loginAttempts.delete(ip);
+    }
+  }
+}, 300_000);
+
 function tooManyLoginAttempts(ip) {
   const now = Date.now();
   const state = loginAttempts.get(ip) || { count: 0, resetAt: now + 60_000 };
@@ -446,6 +456,7 @@ io.on('connection', (socket) => {
   if (role === 'fivem-server' && secret === API_SECRET) {
     console.log(`[fivem-watch] ✓ FiveM server connected (${socket.id})`);
     fivemServerSocket = socket;
+    socket.emit('admin_presence', { count: adminSockets.size });
 
     socket.on('players_update', (players) => {
       const normalized = normalizePlayers(players);
@@ -493,9 +504,11 @@ io.on('connection', (socket) => {
     });
 
     socket.on('disconnect', () => {
-      nuiClients.delete(pid);
-      activeStreams.delete(pid);
-      streamWatchers.delete(pid);
+      if (nuiClients.get(pid) === socket.id) {
+        nuiClients.delete(pid);
+        activeStreams.delete(pid);
+        streamWatchers.delete(pid);
+      }
       console.log(`[fivem-watch] ✗ NUI client disconnected for player #${pid}`);
     });
 
@@ -510,6 +523,10 @@ io.on('connection', (socket) => {
     socket.user = verifiedUser;
     adminSockets.add(socket.id);
     console.log(`[fivem-watch] ✓ Staff connected: ${socket.user.displayName} (${socket.user.role}) [${socket.id}]`);
+
+    if (fivemServerSocket && fivemServerSocket.connected) {
+      fivemServerSocket.emit('admin_presence', { count: adminSockets.size });
+    }
 
     socket.emit('players_update', playersState);
     socket.emit('audit_logs_init', auditLogs.slice(0, 100));
@@ -645,6 +662,10 @@ io.on('connection', (socket) => {
 
     socket.on('disconnect', () => {
       adminSockets.delete(socket.id);
+
+      if (fivemServerSocket && fivemServerSocket.connected) {
+        fivemServerSocket.emit('admin_presence', { count: adminSockets.size });
+      }
 
       for (const [pid, watchers] of streamWatchers.entries()) {
         watchers.delete(socket.id);

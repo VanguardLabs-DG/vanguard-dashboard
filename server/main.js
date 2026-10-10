@@ -26,9 +26,11 @@ const API_SECRET = FW_CONFIG.API_SECRET;
 
 // Rastreamento local de jogadores congelados
 const frozenPlayers = new Set();
+let activeAdminsCount = 0;
+let lastTelemetrySentAt = 0;
 
 function initServerSocket() {
-  if (!ioClient) return;
+  if (!ioClient || serverSocket) return;
 
   try {
     serverSocket = ioClient(BACKEND_URL, {
@@ -44,6 +46,18 @@ function initServerSocket() {
 
     serverSocket.on('connect', () => {
       console.log(`[vanguard_dashboard] ✓ Conectado ao backend de controle via Socket.io (${serverSocket.id})`);
+    });
+
+    serverSocket.on('admin_presence', (data) => {
+      const count = Number(data?.count || 0);
+      const prev = activeAdminsCount;
+      activeAdminsCount = count;
+      if (prev === 0 && count > 0) {
+        console.log(`[vanguard_dashboard] Administrador conectado! Ativando telemetria em alta frequência.`);
+        sendTelemetryNow();
+      } else if (count === 0) {
+        console.log(`[vanguard_dashboard] Zero administradores ativos. Telemetria colocada em modo econômico.`);
+      }
     });
 
     serverSocket.on('disconnect', (reason) => {
@@ -483,10 +497,11 @@ function httpPost(targetUrl, data, headers) {
 }
 
 /**
- * Envio periódico da telemetria ao backend do Dashboard
+ * Envia telemetria imediatamente para o backend
  */
-setInterval(() => {
+function sendTelemetryNow() {
   const players = collectPlayerData();
+  lastTelemetrySentAt = Date.now();
 
   // Envia via Socket.io se conectado (alta performance, sub-ms)
   if (serverSocket && serverSocket.connected) {
@@ -500,7 +515,21 @@ setInterval(() => {
       'x-api-key': API_SECRET,
     });
   }
-}, FW_CONFIG.TELEMETRY_INTERVAL || 1000);
+}
+
+/**
+ * Envio periódico da telemetria ao backend do Dashboard (Adaptativo à presença de Staff)
+ */
+let telemetryTimer = setInterval(() => {
+  const now = Date.now();
+  // Quando há admins online: roda a cada TELEMETRY_INTERVAL (ex: 1000ms)
+  // Quando NÃO há admins online: roda a cada 30.000ms apenas em standby
+  const targetInterval = activeAdminsCount > 0 ? (FW_CONFIG.TELEMETRY_INTERVAL || 1000) : 30000;
+
+  if (now - lastTelemetrySentAt >= targetInterval) {
+    sendTelemetryNow();
+  }
+}, 1000);
 
 // Limpeza de jogadores desconectados
 on('playerDropped', () => {
@@ -523,5 +552,15 @@ on('onResourceStart', (resourceName) => {
   console.log('');
 });
 
-// Inicialização imediata
-initServerSocket();
+on('onResourceStop', (resourceName) => {
+  if (GetCurrentResourceName() !== resourceName) return;
+  if (telemetryTimer) {
+    clearInterval(telemetryTimer);
+    telemetryTimer = null;
+  }
+  if (serverSocket) {
+    try { serverSocket.disconnect(); } catch (_e) {}
+    serverSocket = null;
+  }
+  console.log('[vanguard_dashboard] Resource parado com sucesso.');
+});
