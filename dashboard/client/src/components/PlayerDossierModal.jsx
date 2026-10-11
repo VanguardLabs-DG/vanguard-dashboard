@@ -68,6 +68,8 @@ export default function PlayerDossierModal({
   isStreaming,
 }) {
   const [activeTab, setActiveTab] = useState('dossier'); // 'dossier' | 'inventory' | 'moderation'
+  const [dossierData, setDossierData] = useState(player?.dossier || null);
+  const [dossierLoading, setDossierLoading] = useState(!player?.dossier);
   const [inventoryData, setInventoryData] = useState(null);
   const [invLoading, setInvLoading] = useState(false);
   const [invSearch, setInvSearch] = useState('');
@@ -78,6 +80,45 @@ export default function PlayerDossierModal({
   const [warnMessage, setWarnMessage] = useState('');
   const [kickReason, setKickReason] = useState('');
   const [customCoords, setCustomCoords] = useState({ x: '', y: '', z: '' });
+
+  // Busca dados do Dossiê via QBX Core sob demanda (Task 4)
+  const fetchDossier = () => {
+    if (!player?.id) return;
+    if (!player?.dossier && !dossierData) {
+      setDossierLoading(true);
+    }
+    const socket = getSocket();
+    if (!socket) {
+      setDossierLoading(false);
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      setDossierLoading(false);
+    }, 2500);
+
+    socket.emit('get_player_dossier', { playerId: player.id }, (response) => {
+      clearTimeout(timer);
+      setDossierLoading(false);
+      if (response && response.success) {
+        setDossierData(response.dossier);
+      } else if (!player?.dossier) {
+        setStatusMessage({
+          type: 'error',
+          text: response?.error || 'Não foi possível consultar dossiê no QBX Core.',
+        });
+      }
+    });
+  };
+
+  useEffect(() => {
+    if (player?.dossier) {
+      setDossierData(player.dossier);
+      setDossierLoading(false);
+    } else if (player?.id && !dossierData) {
+      fetchDossier();
+    }
+  }, [player?.id, player?.dossier]);
 
   // Busca dados do ox_inventory quando a aba de inventário é acessada
   const fetchInventory = () => {
@@ -152,7 +193,7 @@ export default function PlayerDossierModal({
 
   if (!player) return null;
 
-  const dossier = player.dossier || {};
+  const dossier = dossierData || player.dossier || {};
   const vehicle = player.vehicle;
   const isFrozen = Boolean(player.isFrozen);
 
@@ -260,13 +301,20 @@ export default function PlayerDossierModal({
           {/* ════ ABA 1: DOSSIÊ DO CIDADÃO (PILAR 2) ════ */}
           {activeTab === 'dossier' && (
             <div className="dossier-tab-content">
-              {/* Barra de Status Vitais */}
-              <div className="dossier-card-grid">
-                <div className="dossier-stat-card">
-                  <div className="dossier-stat-label">
-                    <Heart size={16} weight="fill" className="text-danger" />
-                    <span>Saúde (HP)</span>
-                  </div>
+              {dossierLoading && !dossier.citizenid && !dossier.job ? (
+                <div className="dossier-loading-state">
+                  <ArrowsClockwise size={32} className="spin text-accent" />
+                  <p>Consultando Dossiê do Cidadão no QBX Core...</p>
+                </div>
+              ) : (
+                <>
+                  {/* Barra de Status Vitais */}
+                  <div className="dossier-card-grid">
+                    <div className="dossier-stat-card">
+                      <div className="dossier-stat-label">
+                        <Heart size={16} weight="fill" className="text-danger" />
+                        <span>Saúde (HP)</span>
+                      </div>
                   <div className="dossier-stat-value font-mono">
                     {player.health ?? 0} / 100
                   </div>
@@ -403,6 +451,8 @@ export default function PlayerDossierModal({
                   </div>
                 )}
               </div>
+                </>
+              )}
             </div>
           )}
 

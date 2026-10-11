@@ -24,8 +24,9 @@ let serverSocket = null;
 const BACKEND_URL = FW_CONFIG.SERVER_BACKEND_URL || 'http://127.0.0.1:3001';
 const API_SECRET = FW_CONFIG.API_SECRET;
 
-// Rastreamento local de jogadores congelados
+// Rastreamento local de jogadores congelados e cache de nomes RP
 const frozenPlayers = new Set();
+const characterNameCache = new Map();
 let activeAdminsCount = 0;
 let lastTelemetrySentAt = 0;
 
@@ -83,6 +84,32 @@ function initServerSocket() {
         }
       } catch (err) {
         console.error(`[vanguard_dashboard] Erro ao consultar ox_inventory para #${targetId}:`, err.message);
+        if (typeof callback === 'function') callback({ success: false, error: err.message });
+      }
+    });
+
+    // ─── RPC: Consulta sob Demanda de Dossiê RP (QBX Core - Pilar 2) ──
+    serverSocket.on('get_player_dossier', (data, callback) => {
+      const targetId = parseInt(data?.playerId);
+      if (!Number.isInteger(targetId) || targetId <= 0) {
+        if (typeof callback === 'function') callback({ success: false, error: 'ID de jogador inválido' });
+        return;
+      }
+
+      try {
+        const dossier = getPlayerDossierData(targetId);
+        if (typeof callback === 'function') {
+          if (dossier) {
+            callback({ success: true, dossier });
+          } else {
+            callback({
+              success: false,
+              error: 'Dossiê não encontrado (personagem não carregado ou qbx_core indisponível).',
+            });
+          }
+        }
+      } catch (err) {
+        console.error(`[vanguard_dashboard] Erro ao consultar dossiê para #${targetId}:`, err.message);
         if (typeof callback === 'function') callback({ success: false, error: err.message });
       }
     });
@@ -330,6 +357,49 @@ function getPlayerInventoryData(playerId) {
 }
 
 /**
+ * Consulta sob demanda de dossiê completo RP via QBX Core (Task 4)
+ */
+function getPlayerDossierData(playerId) {
+  try {
+    if (!exports?.qbx_core?.GetPlayer) return null;
+    const qbxPlayer = exports.qbx_core.GetPlayer(playerId);
+    if (!qbxPlayer?.PlayerData) return null;
+
+    const pd = qbxPlayer.PlayerData;
+    const char = pd.charinfo || {};
+
+    return {
+      citizenid: pd.citizenid || 'N/A',
+      firstname: char.firstname || '',
+      lastname: char.lastname || '',
+      birthdate: char.birthdate || '',
+      gender: char.gender === 0 ? 'M' : (char.gender === 1 ? 'F' : 'Outro'),
+      phone: char.phone || 'Sem telefone',
+      job: {
+        name: pd.job?.name || 'unemployed',
+        label: pd.job?.label || 'Desempregado',
+        gradeName: pd.job?.grade?.name || 'Iniciante',
+        gradeLevel: pd.job?.grade?.level ?? 0,
+        onduty: Boolean(pd.job?.onduty),
+      },
+      gang: {
+        name: pd.gang?.name || 'none',
+        label: pd.gang?.label || 'Nenhuma',
+        gradeName: pd.gang?.grade?.name || 'Membro',
+      },
+      money: {
+        cash: pd.money?.cash || 0,
+        bank: pd.money?.bank || 0,
+        crypto: pd.money?.crypto || 0,
+      },
+    };
+  } catch (err) {
+    console.error(`[vanguard_dashboard] Erro ao extrair dossiê para #${playerId}:`, err.message);
+    return null;
+  }
+}
+
+/**
  * Retorna a lista de IDs de jogadores conectados
  */
 function getConnectedPlayerIds() {
@@ -379,7 +449,7 @@ function collectPlayerData() {
     const ping = typeof GetPlayerPing === 'function' ? Math.max(0, parseInt(GetPlayerPing(idStr)) || 0) : 0;
 
     let steamName = GetPlayerName(idStr) || `Player ${playerId}`;
-    let characterName = steamName;
+    let characterName = characterNameCache.get(playerId) || steamName;
     let dossier = null;
 
     // ─── Enriquecimento RP via QBX Core (Pilar 2: Dossiê do Cidadão) ───
@@ -391,6 +461,7 @@ function collectPlayerData() {
           const char = pd.charinfo || {};
           if (char.firstname && char.lastname) {
             characterName = `${char.firstname} ${char.lastname}`;
+            characterNameCache.set(playerId, characterName);
           }
 
           dossier = {
@@ -418,6 +489,19 @@ function collectPlayerData() {
               crypto: pd.money?.crypto || 0,
             },
           };
+        }
+      }
+    } catch (_e) {}
+
+    // ─── Detecção de Voz em Tempo Real (pma-voice / Mumble / StateBag) ───
+    let isTalking = false;
+    try {
+      if (typeof MumbleIsPlayerTalking === 'function') {
+        isTalking = Boolean(MumbleIsPlayerTalking(playerId) || MumbleIsPlayerTalking(ped));
+      } else if (typeof Player === 'function') {
+        const plyObj = Player(idStr);
+        if (plyObj?.state?.talking !== undefined) {
+          isTalking = Boolean(plyObj.state.talking);
         }
       }
     } catch (_e) {}
@@ -460,6 +544,7 @@ function collectPlayerData() {
       armor: armor,
       heading: ((heading % 360) + 360) % 360,
       isFrozen: frozenPlayers.has(playerId),
+      isTalking: isTalking,
       dossier: dossier,
       vehicle: vehicleData,
     });
@@ -518,13 +603,11 @@ function sendTelemetryNow() {
 }
 
 /**
- * Envio periódico da telemetria ao backend do Dashboard (Adaptativo à presença de Staff)
+ * Envio periódico da telemetria contínua ao backend do Dashboard (1000ms padrão)
  */
 let telemetryTimer = setInterval(() => {
   const now = Date.now();
-  // Quando há admins online: roda a cada TELEMETRY_INTERVAL (ex: 1000ms)
-  // Quando NÃO há admins online: roda a cada 30.000ms apenas em standby
-  const targetInterval = activeAdminsCount > 0 ? (FW_CONFIG.TELEMETRY_INTERVAL || 1000) : 30000;
+  const targetInterval = (FW_CONFIG && FW_CONFIG.TELEMETRY_INTERVAL) ? FW_CONFIG.TELEMETRY_INTERVAL : 1000;
 
   if (now - lastTelemetrySentAt >= targetInterval) {
     sendTelemetryNow();
@@ -535,7 +618,9 @@ let telemetryTimer = setInterval(() => {
 on('playerDropped', () => {
   const src = source;
   if (src) {
-    frozenPlayers.delete(parseInt(src));
+    const id = parseInt(src);
+    frozenPlayers.delete(id);
+    characterNameCache.delete(id);
   }
 });
 

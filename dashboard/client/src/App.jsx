@@ -349,6 +349,7 @@ export default function App() {
                   key={playerId}
                   playerId={playerId}
                   playerName={player?.characterName || player?.name}
+                  isTalking={Boolean(player?.isTalking)}
                   indexOffset={index}
                   isGridMode={true}
                   onClose={() => handleStopStream(playerId)}
@@ -367,6 +368,7 @@ export default function App() {
                   key={playerId}
                   playerId={playerId}
                   playerName={player?.characterName || player?.name}
+                  isTalking={Boolean(player?.isTalking)}
                   indexOffset={index}
                   isGridMode={false}
                   onClose={() => handleStopStream(playerId)}

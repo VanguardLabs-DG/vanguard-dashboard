@@ -20,6 +20,7 @@ require('dotenv').config();
 const express = require('express');
 const fs = require('fs');
 const http = require('http');
+const https = require('https');
 const { Server } = require('socket.io');
 const cors = require('cors');
 const path = require('path');
@@ -37,6 +38,7 @@ const NODE_ENV = process.env.NODE_ENV || 'development';
 const CLIENT_DIST = path.resolve(__dirname, process.env.CLIENT_DIST || path.join('..', 'client', 'dist'));
 const MAX_PLAYERS_PER_INGEST = Number(process.env.MAX_PLAYERS_PER_INGEST || 2048);
 const MAX_FRAME_LENGTH = Number(process.env.MAX_FRAME_LENGTH || 5_000_000);
+const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL || null;
 
 // ─── Audit Logging Setup (Pilar 1) ─────────────────────────────
 const AUDIT_LOG_FILE = path.join(__dirname, 'logs', 'audit.json');
@@ -124,6 +126,63 @@ function appendAuditLog(entry) {
   }
 }
 
+/**
+ * Despacho assíncrono e defensivo de webhooks para o Discord (Task 5)
+ */
+function sendDiscordWebhook({ title, description, fields = [], color = 0x2b2d31, author = null, footer = null }) {
+  const webhookUrl = process.env.DISCORD_WEBHOOK_URL || DISCORD_WEBHOOK_URL;
+  if (!webhookUrl || typeof webhookUrl !== 'string' || !webhookUrl.startsWith('https://discord.com/api/webhooks/')) {
+    return;
+  }
+
+  try {
+    const parsed = new URL(webhookUrl);
+    const embed = {
+      title,
+      description,
+      color,
+      fields,
+      timestamp: new Date().toISOString(),
+      footer: footer || { text: 'Vanguard Dashboard • Security & Audit' },
+    };
+
+    if (author) {
+      embed.author = author;
+    }
+
+    const payload = JSON.stringify({
+      username: 'Vanguard Surveillance',
+      avatar_url: 'https://i.imgur.com/vHqLqL0.png',
+      embeds: [embed],
+    });
+
+    const options = {
+      hostname: parsed.hostname,
+      port: 443,
+      path: parsed.pathname + (parsed.search || ''),
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(payload),
+      },
+      timeout: 3000,
+    };
+
+    const req = https.request(options, (res) => {
+      res.resume();
+    });
+
+    req.on('error', (err) => {
+      console.warn('[fivem-watch] Falha silenciosa ao despachar Discord Webhook:', err.message);
+    });
+
+    req.write(payload);
+    req.end();
+  } catch (err) {
+    console.warn('[fivem-watch] Erro ao preparar webhook Discord:', err.message);
+  }
+}
+
 function parseCorsOrigin(value) {
   if (value.trim() === '*') return true;
   const list = value.split(',').map((s) => s.trim()).filter(Boolean);
@@ -170,6 +229,7 @@ function normalizePlayer(player) {
     armor: Math.max(0, Math.min(100, Number(player.armor) || 0)),
     heading: ((Number(player.heading) || 0) % 360 + 360) % 360,
     isFrozen: Boolean(player.isFrozen),
+    isTalking: Boolean(player.isTalking),
     dossier: player.dossier && typeof player.dossier === 'object' ? player.dossier : null,
     vehicle: player.vehicle && typeof player.vehicle === 'object' ? player.vehicle : null,
   };
@@ -199,6 +259,13 @@ function isValidPlayerId(value) {
 }
 
 function isValidFrame(data) {
+  if (Buffer.isBuffer(data)) {
+    return data.length > 0 && data.length <= MAX_FRAME_LENGTH;
+  }
+  if (data instanceof ArrayBuffer || (data && data.buffer instanceof ArrayBuffer)) {
+    const byteLength = data.byteLength || data.buffer.byteLength;
+    return byteLength > 0 && byteLength <= MAX_FRAME_LENGTH;
+  }
   return typeof data === 'string' && data.length <= MAX_FRAME_LENGTH && data.startsWith('data:image/webp;base64,');
 }
 
@@ -562,6 +629,17 @@ io.on('connection', (socket) => {
         targetPlayerName: player?.name,
       });
 
+      sendDiscordWebhook({
+        title: '▶️ Telagem Iniciada (Surveillance)',
+        color: 0x3b82f6,
+        description: `O administrador **${socket.user.displayName}** iniciou a telagem ao vivo do jogador #${pid}.`,
+        fields: [
+          { name: 'Admin', value: `${socket.user.displayName} (${socket.user.username})`, inline: true },
+          { name: 'Jogador Alvo', value: `${player?.name || 'Desconhecido'} (#${pid})`, inline: true },
+          { name: 'Data / Hora', value: `<t:${Math.floor(Date.now() / 1000)}:F>`, inline: false },
+        ],
+      });
+
       socket.emit('stream_started', { playerId: pid });
     });
 
@@ -606,6 +684,16 @@ io.on('connection', (socket) => {
         targetPlayerName: player?.name,
       });
 
+      sendDiscordWebhook({
+        title: '⏹️ Telagem Finalizada',
+        color: 0x6b7280,
+        description: `A sessão de telagem para o jogador #${pid} foi encerrada por **${socket.user.displayName}**.`,
+        fields: [
+          { name: 'Admin', value: `${socket.user.displayName}`, inline: true },
+          { name: 'Jogador Alvo', value: `${player?.name || 'Desconhecido'} (#${pid})`, inline: true },
+        ],
+      });
+
       socket.emit('stream_stopped', { playerId: pid });
     });
 
@@ -618,6 +706,19 @@ io.on('connection', (socket) => {
       }
 
       fivemServerSocket.emit('get_player_inventory', { playerId: pid }, (response) => {
+        if (typeof callback === 'function') callback(response);
+      });
+    });
+
+    // ─── RPC: Consulta sob Demanda de Dossiê RP (Task 4) ────────
+    socket.on('get_player_dossier', (data, callback) => {
+      const pid = data?.playerId;
+      if (!fivemServerSocket || !fivemServerSocket.connected) {
+        if (typeof callback === 'function') callback({ success: false, error: 'Servidor FiveM desconectado.' });
+        return;
+      }
+
+      fivemServerSocket.emit('get_player_dossier', { playerId: pid }, (response) => {
         if (typeof callback === 'function') callback(response);
       });
     });
@@ -651,6 +752,20 @@ io.on('connection', (socket) => {
             result: response?.message || response?.error || 'Ação registrada.',
           },
         });
+
+        sendDiscordWebhook({
+          title: `🛡️ Ação Administrativa: ${String(data?.action || 'AÇÃO').toUpperCase()}`,
+          color: response?.success ? 0xef4444 : 0xf59e0b,
+          description: `Ação remota executada via Dashboard Web por **${staffName}**.`,
+          fields: [
+            { name: 'Staff', value: staffName, inline: true },
+            { name: 'Jogador Alvo', value: `${player?.name || 'ID ' + targetId} (#${targetId})`, inline: true },
+            { name: 'Status', value: response?.success ? '✅ Sucesso' : '❌ Falhou', inline: true },
+            { name: 'Opções', value: '```json\n' + JSON.stringify(data?.options || {}, null, 2) + '\n```', inline: false },
+            { name: 'Resultado', value: String(response?.message || response?.error || 'OK'), inline: false },
+          ],
+        });
+
         if (typeof callback === 'function') callback(response);
       });
     });

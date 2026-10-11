@@ -38,6 +38,7 @@ const QUALITY_PRESETS = {
 export default function LiveStream({
   playerId,
   playerName,
+  isTalking = false,
   indexOffset = 0,
   isGridMode = false,
   onClose,
@@ -56,6 +57,17 @@ export default function LiveStream({
   const recordedChunksRef = useRef([]);
   const canvasRef = useRef(null);
   const recordTimerRef = useRef(null);
+  const prevObjectUrlRef = useRef(null);
+
+  // Limpeza de Object URLs ao desmontar componente para evitar memory leaks
+  useEffect(() => {
+    return () => {
+      if (prevObjectUrlRef.current && prevObjectUrlRef.current.startsWith('blob:')) {
+        URL.revokeObjectURL(prevObjectUrlRef.current);
+        prevObjectUrlRef.current = null;
+      }
+    };
+  }, []);
 
   const [qualityLevel, setQualityLevel] = useState(() => {
     try {
@@ -80,33 +92,53 @@ export default function LiveStream({
     localStorage.setItem('fivem-watch-quality', qualityLevel);
   }, [qualityLevel, playerId]);
 
-  // Recebimento de Frames e desenho no Canvas interno
+  // Recebimento de Frames (Binário / Blob / Base64) e desenho no Canvas interno
   useEffect(() => {
     const socket = getSocket();
     if (!socket || playerId == null) return;
 
     const handleFrame = (data) => {
       if (String(data.playerId) === String(playerId)) {
-        setFrame(data.frame);
-        if (loading) setLoading(false);
+        let frameUrl = null;
+        if (typeof data.frame === 'string') {
+          frameUrl = data.frame;
+        } else if (data.frame instanceof Blob) {
+          frameUrl = URL.createObjectURL(data.frame);
+        } else if (data.frame instanceof ArrayBuffer || (data.frame && data.frame.buffer instanceof ArrayBuffer)) {
+          const blob = new Blob([data.frame], { type: 'image/webp' });
+          frameUrl = URL.createObjectURL(blob);
+        }
 
-        // Desenha no canvas auxiliar para permitir gravação e prints sem cross-origin
-        if (canvasRef.current && data.frame) {
-          const img = new Image();
-          img.onload = () => {
-            const canvas = canvasRef.current;
-            if (canvas) {
-              if (canvas.width !== img.width || canvas.height !== img.height) {
-                canvas.width = img.width;
-                canvas.height = img.height;
+        if (frameUrl) {
+          // Revoga o blob anterior para liberar V8 Heap / GPU Texture Memory imediatamente
+          if (prevObjectUrlRef.current && prevObjectUrlRef.current !== frameUrl && prevObjectUrlRef.current.startsWith('blob:')) {
+            URL.revokeObjectURL(prevObjectUrlRef.current);
+          }
+          if (frameUrl.startsWith('blob:')) {
+            prevObjectUrlRef.current = frameUrl;
+          }
+
+          setFrame(frameUrl);
+          if (loading) setLoading(false);
+
+          // Desenha no canvas auxiliar para permitir gravação e prints sem cross-origin
+          if (canvasRef.current) {
+            const img = new Image();
+            img.onload = () => {
+              const canvas = canvasRef.current;
+              if (canvas) {
+                if (canvas.width !== img.width || canvas.height !== img.height) {
+                  canvas.width = img.width;
+                  canvas.height = img.height;
+                }
+                const ctx = canvas.getContext('2d');
+                if (ctx) {
+                  ctx.drawImage(img, 0, 0);
+                }
               }
-              const ctx = canvas.getContext('2d');
-              if (ctx) {
-                ctx.drawImage(img, 0, 0);
-              }
-            }
-          };
-          img.src = data.frame;
+            };
+            img.src = frameUrl;
+          }
         }
       }
     };
@@ -293,6 +325,12 @@ export default function LiveStream({
             <div className={`stream-live-dot ${isRecording ? 'recording' : ''}`} />
             <span className="stream-header-title">
               #{playerId} {playerName || 'Unknown'}
+            </span>
+            <span
+              className={`voice-badge ${isTalking ? 'talking' : 'muted'}`}
+              title={isTalking ? 'Jogador falando no VOIP (pma-voice / Mumble)' : 'Jogador em silêncio'}
+            >
+              {isTalking ? '🎙️ FALANDO' : '🔇 MUDO'}
             </span>
             {isRecording && (
               <span className="rec-badge font-mono">

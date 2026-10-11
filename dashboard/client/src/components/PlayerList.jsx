@@ -122,6 +122,11 @@ export default function PlayerList({
                       <span className="player-char-name">
                         {player.characterName || player.name}
                       </span>
+                      {player.isTalking && (
+                        <span className="voice-tag talking" title="Falando no VOIP (pma-voice / Mumble)">
+                          🎙️
+                        </span>
+                      )}
                       {isFrozen && (
                         <span className="frozen-badge" title="Jogador Congelado">
                           <Snowflake size={12} weight="bold" />

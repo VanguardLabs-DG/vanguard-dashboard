@@ -1954,3 +1954,72 @@ body {
   font-weight: 700;
   border-color: var(--color-accent);
 }
+
+/* ─── Real-Time Voice Telemetry Badges (Task 1) ─────────────── */
+.voice-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 7px;
+  border-radius: 4px;
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.3px;
+  font-family: var(--font-mono);
+  transition: all var(--transition-fast);
+}
+
+.voice-badge.talking {
+  background: rgba(16, 185, 129, 0.2);
+  color: #10b981;
+  border: 1px solid rgba(16, 185, 129, 0.4);
+  animation: pulse-voice 1.2s infinite ease-in-out;
+}
+
+.voice-badge.muted {
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--color-text-muted);
+  border: 1px solid var(--color-border);
+}
+
+.voice-tag {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1px 4px;
+  border-radius: 3px;
+  font-size: 0.72rem;
+  line-height: 1;
+}
+
+.voice-tag.talking {
+  background: rgba(16, 185, 129, 0.25);
+  color: #10b981;
+  animation: pulse-voice 1.2s infinite ease-in-out;
+}
+
+@keyframes pulse-voice {
+  0%, 100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.85;
+    transform: scale(1.05);
+  }
+}
+
+.dossier-loading-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 48px 24px;
+  gap: 12px;
+  color: var(--color-text-muted);
+  font-size: 0.88rem;
+}
+
+.dossier-loading-state .spin {
+  animation: spin 1s linear infinite;
+}
