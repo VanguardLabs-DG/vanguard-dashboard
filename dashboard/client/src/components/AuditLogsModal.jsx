@@ -99,24 +99,48 @@ export default function AuditLogsModal({ onClose }) {
   const [filterCategory, setFilterCategory] = useState('all'); // 'all' | 'stream' | 'moderation'
   const [searchQuery, setSearchQuery] = useState('');
 
-  const fetchLogs = useCallback(() => {
+  const fetchLogs = useCallback(async () => {
     setLoading(true);
-    const socket = getSocket();
-    if (!socket) {
-      setLoading(false);
-      return;
+    let loaded = false;
+
+    // 1. Tenta REST API imediatamente (retorno em <50ms)
+    try {
+      const token = localStorage.getItem('fivem-watch-token');
+      const res = await fetch('/api/audit-logs', {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (Array.isArray(data)) {
+          setLogs(data.filter((item) => item && typeof item === 'object'));
+          setLoading(false);
+          loaded = true;
+        }
+      }
+    } catch (_err) {
+      // Fallback para socket se requisição REST falhar
     }
 
-    try {
-      socket.emit('get_audit_logs', (data) => {
+    // 2. Fallback via Socket com proteção de timeout
+    const socket = getSocket();
+    if (socket && !loaded) {
+      const safetyTimer = setTimeout(() => {
         setLoading(false);
-        if (Array.isArray(data)) {
-          // Filtra elementos inválidos
-          setLogs(data.filter((item) => item && typeof item === 'object'));
-        }
-      });
-    } catch (err) {
-      console.error('[AuditLogsModal] Erro ao buscar logs:', err);
+      }, 2000);
+
+      try {
+        socket.emit('get_audit_logs', (data) => {
+          clearTimeout(safetyTimer);
+          setLoading(false);
+          if (Array.isArray(data)) {
+            setLogs(data.filter((item) => item && typeof item === 'object'));
+          }
+        });
+      } catch (_err) {
+        clearTimeout(safetyTimer);
+        setLoading(false);
+      }
+    } else if (!loaded) {
       setLoading(false);
     }
   }, []);

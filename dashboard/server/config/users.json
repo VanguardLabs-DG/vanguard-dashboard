@@ -7,7 +7,7 @@
     "passwordHash": "8e130286856a8afed8b76babc2fd9935262a01382ac9cabbbe0f7f8378403b52e074a0619a6980a617bfe985f63a6ac81bba3e8ccb0cd9146c5c40e65aea834a",
     "mustChangePassword": false,
     "createdAt": "2026-10-06T00:20:18.553Z",
-    "lastLogin": "2026-10-06T16:17:28.754Z",
+    "lastLogin": "2026-10-12T12:26:34.597Z",
     "passwordUpdatedAt": "2026-10-06T01:05:55.164Z"
   },
   {
@@ -46,11 +46,12 @@
     "username": "baya",
     "displayName": "Baya",
     "role": "admin",
-    "salt": "6e00a4cd8fa9f9551197f115769fa0ab",
-    "passwordHash": "3eaba3f88ffbff3dbff82d460c0d034098c1329517a9d78749a401e1c836944c0b0cf342c78b53633c75811c60553249c044aeb8bb08c15e818bacaf231570a5",
-    "mustChangePassword": true,
+    "salt": "3779b980b9d4bf8192ac07da0f4ba5c1",
+    "passwordHash": "18da182d2bb6a986ebcffd53030b50e1a8a5c911ec43e6916562a9a6ee078ba5d15f9d46f057d52051d97bf59064aeb372e47b9d315715510a58889509e2ceca",
+    "mustChangePassword": false,
     "createdAt": "2026-10-06T00:20:18.708Z",
-    "lastLogin": "2026-10-06T00:27:48.560Z"
+    "lastLogin": "2026-10-12T04:04:41.027Z",
+    "passwordUpdatedAt": "2026-10-12T04:04:55.933Z"
   },
   {
     "username": "morgan",

@@ -24,7 +24,29 @@ const https = require('https');
 const { Server } = require('socket.io');
 const cors = require('cors');
 const path = require('path');
+const crypto = require('crypto');
 const auth = require('./auth');
+
+function verifyStreamToken(playerId, tokenStr, secret) {
+  if (!tokenStr || typeof tokenStr !== 'string') return false;
+  const parts = tokenStr.split('.');
+  if (parts.length !== 2) return false;
+  const [hmac, tsStr] = parts;
+  const ts = Number(tsStr);
+  if (!Number.isFinite(ts)) return false;
+  // Validade de 24 horas
+  if (Math.abs(Date.now() - ts) > 24 * 3600 * 1000) return false;
+
+  const expected = crypto.createHmac('sha256', secret).update(`${playerId}:${ts}`).digest('hex');
+  try {
+    const a = Buffer.from(hmac, 'hex');
+    const b = Buffer.from(expected, 'hex');
+    if (a.length !== b.length) return false;
+    return crypto.timingSafeEqual(a, b);
+  } catch (_e) {
+    return false;
+  }
+}
 
 // ─── Configuration ─────────────────────────────────────────────
 const DEFAULT_SECRET = 'CHANGE_ME_TO_A_RANDOM_SECRET';
@@ -230,6 +252,10 @@ function normalizePlayer(player) {
     heading: ((Number(player.heading) || 0) % 360 + 360) % 360,
     isFrozen: Boolean(player.isFrozen),
     isTalking: Boolean(player.isTalking),
+    isVoiceMuted: Boolean(player.isVoiceMuted),
+    isChatMuted: Boolean(player.isChatMuted),
+    cid: Number(player.cid || player.dossier?.cid || 1),
+    isInMultichar: Boolean(player.isInMultichar),
     dossier: player.dossier && typeof player.dossier === 'object' ? player.dossier : null,
     vehicle: player.vehicle && typeof player.vehicle === 'object' ? player.vehicle : null,
   };
@@ -445,9 +471,11 @@ app.get('/api/health', (_req, res) => {
 });
 
 app.get('/api/audit-logs', (req, res) => {
-  const apiKey = req.headers['x-api-key'] || req.query.token;
-  if (apiKey !== API_SECRET) {
-    return res.status(403).json({ error: 'Invalid API key' });
+  const authHeader = req.headers['authorization'];
+  const token = authHeader ? authHeader.replace(/^Bearer\s+/i, '') : (req.headers['x-api-key'] || req.query.token);
+  const verifiedUser = auth.verifySessionToken(token, API_SECRET);
+  if (!verifiedUser && token !== API_SECRET) {
+    return res.status(403).json({ error: 'Acesso negado: token inválido' });
   }
   res.json(auditLogs);
 });
@@ -492,6 +520,204 @@ app.get('/api/item-images/:item', (req, res) => {
   return res.status(404).end();
 });
 
+// ─── ox_inventory Item & Weapons Catalog ───────────────────────
+const OX_ITEMS_FILE = '/home/bases/mri_paulista/resources/[ox]/ox_inventory/data/items.lua';
+const OX_WEAPONS_FILE = '/home/bases/mri_paulista/resources/[ox]/ox_inventory/data/weapons.lua';
+let itemsCatalog = [];
+
+function inferItemCategory(name, label, type) {
+  const n = String(name || '').toLowerCase();
+  const l = String(label || '').toLowerCase();
+
+  if (type === 'weapon' || n.startsWith('weapon_') || n.startsWith('wep_')) return 'weapons';
+  if (type === 'ammo' || n.startsWith('ammo-') || n.startsWith('ammo_') || n.endsWith('_ammo') || l.includes('munição')) return 'ammo';
+  if (
+    n.includes('water') || n.includes('bread') || n.includes('food') || n.includes('drink') ||
+    n.includes('burger') || n.includes('pizza') || n.includes('beer') || n.includes('pipoca') ||
+    n.includes('sanduiche') || n.includes('batata') || n.includes('suco') || n.includes('refrigerante') ||
+    l.includes('água') || l.includes('pão') || l.includes('suco') || l.includes('lanche') ||
+    l.includes('cerveja') || l.includes('comida')
+  ) {
+    return 'consumables';
+  }
+  if (
+    n.includes('med') || n.includes('bandage') || n.includes('pill') || n.includes('firstaid') ||
+    n.includes('remedio') || l.includes('curativo') || l.includes('kit') || l.includes('remédio') ||
+    l.includes('gaze') || l.includes('médic') || l.includes('analgésico')
+  ) {
+    return 'medical';
+  }
+  if (
+    n.includes('lockpick') || n.includes('drill') || n.includes('radio') || n.includes('phone') ||
+    n.includes('repair') || n.includes('wrench') || n.includes('chave') || n.includes('algema') ||
+    l.includes('chave') || l.includes('ferramenta') || l.includes('rádio') || l.includes('celular') ||
+    l.includes('lockpick') || l.includes('algema')
+  ) {
+    return 'tools';
+  }
+  return 'all';
+}
+
+function loadItemsCatalog() {
+  try {
+    const itemMap = new Map();
+
+    // 1. Catálogo principal de itens (data/items.lua)
+    if (fs.existsSync(OX_ITEMS_FILE)) {
+      const content = fs.readFileSync(OX_ITEMS_FILE, 'utf8');
+      const itemRegex = /\[["']([^"']+)["']\]\s*=\s*\{([\s\S]*?)(?=\n\t*\[["']|\n\};|\n\}$)/g;
+      let m;
+      while ((m = itemRegex.exec(content)) !== null) {
+        const name = m[1];
+        const body = m[2];
+        const labelMatch = body.match(/label\s*=\s*["']([^"']+)["']/);
+        const weightMatch = body.match(/weight\s*=\s*([0-9.]+)/);
+        const label = labelMatch ? labelMatch[1] : name;
+        const weight = weightMatch ? Number(weightMatch[1]) : 0;
+        const cat = inferItemCategory(name, label, 'item');
+        itemMap.set(name.toLowerCase(), {
+          name,
+          label,
+          weight,
+          type: cat === 'weapons' ? 'weapon' : (cat === 'ammo' ? 'ammo' : 'item'),
+          category: cat,
+        });
+      }
+    }
+
+    // 2. Armas, Munições e Componentes (data/weapons.lua)
+    if (fs.existsSync(OX_WEAPONS_FILE)) {
+      const content = fs.readFileSync(OX_WEAPONS_FILE, 'utf8');
+
+      // Seção Weapons
+      const wepSectionMatch = content.match(/Weapons\s*=\s*\{([\s\S]*?)(?=\n\t*[A-Z][a-zA-Z0-9_]*\s*=\s*\{|\n\};|\n\}$)/);
+      if (wepSectionMatch) {
+        const r = /\[["']([^"']+)["']\]\s*=\s*\{([\s\S]*?)(?=\n\t*\[["']|\n\t*\};|\n\};|\n\}$)/g;
+        let m;
+        while ((m = r.exec(wepSectionMatch[1])) !== null) {
+          const name = m[1];
+          const body = m[2];
+          const labelMatch = body.match(/label\s*=\s*["']([^"']+)["']/);
+          const weightMatch = body.match(/weight\s*=\s*([0-9.]+)/);
+          const label = labelMatch ? labelMatch[1] : name;
+          const weight = weightMatch ? Number(weightMatch[1]) : 1000;
+          itemMap.set(name.toLowerCase(), {
+            name,
+            label,
+            weight,
+            type: 'weapon',
+            category: 'weapons',
+          });
+        }
+      }
+
+      // Seção Ammo
+      const ammoSectionMatch = content.match(/Ammo\s*=\s*\{([\s\S]*?)(?=\n\t*[A-Z][a-zA-Z0-9_]*\s*=\s*\{|\n\};|\n\}$)/);
+      if (ammoSectionMatch) {
+        const r = /\[["']([^"']+)["']\]\s*=\s*\{([\s\S]*?)(?=\n\t*\[["']|\n\t*\};|\n\};|\n\}$)/g;
+        let m;
+        while ((m = r.exec(ammoSectionMatch[1])) !== null) {
+          const name = m[1];
+          const body = m[2];
+          const labelMatch = body.match(/label\s*=\s*["']([^"']+)["']/);
+          const weightMatch = body.match(/weight\s*=\s*([0-9.]+)/);
+          const label = labelMatch ? labelMatch[1] : name;
+          const weight = weightMatch ? Number(weightMatch[1]) : 10;
+          itemMap.set(name.toLowerCase(), {
+            name,
+            label,
+            weight,
+            type: 'ammo',
+            category: 'ammo',
+          });
+        }
+      }
+
+      // Seção Components
+      const compSectionMatch = content.match(/Components\s*=\s*\{([\s\S]*?)(?=\n\t*[A-Z][a-zA-Z0-9_]*\s*=\s*\{|\n\};|\n\}$)/);
+      if (compSectionMatch) {
+        const r = /\[["']([^"']+)["']\]\s*=\s*\{([\s\S]*?)(?=\n\t*\[["']|\n\t*\};|\n\};|\n\}$)/g;
+        let m;
+        while ((m = r.exec(compSectionMatch[1])) !== null) {
+          const name = m[1];
+          const body = m[2];
+          const labelMatch = body.match(/label\s*=\s*["']([^"']+)["']/);
+          const weightMatch = body.match(/weight\s*=\s*([0-9.]+)/);
+          const label = labelMatch ? labelMatch[1] : name;
+          const weight = weightMatch ? Number(weightMatch[1]) : 100;
+          itemMap.set(name.toLowerCase(), {
+            name,
+            label,
+            weight,
+            type: 'component',
+            category: 'weapons',
+          });
+        }
+      }
+    }
+
+    // 3. Fallback abrangente: Todas as imagens disponíveis em ox_inventory/web/images
+    if (fs.existsSync(OX_IMAGES_DIR)) {
+      const files = fs.readdirSync(OX_IMAGES_DIR);
+      for (const f of files) {
+        if (!f.endsWith('.png')) continue;
+        const rawName = f.slice(0, -4);
+        const key = rawName.toLowerCase();
+        if (!itemMap.has(key)) {
+          const isWep = rawName.toUpperCase().startsWith('WEAPON_');
+          const isAmmo = rawName.toLowerCase().startsWith('ammo-') || rawName.toLowerCase().startsWith('ammo_');
+          const prettyLabel = rawName
+            .replace(/^WEAPON_/i, '')
+            .replace(/_/g, ' ')
+            .replace(/\b\w/g, (l) => l.toUpperCase());
+          const cat = inferItemCategory(rawName, prettyLabel, isWep ? 'weapon' : (isAmmo ? 'ammo' : 'item'));
+          itemMap.set(key, {
+            name: isWep ? rawName.toUpperCase() : rawName,
+            label: prettyLabel,
+            weight: isWep ? 2000 : (isAmmo ? 15 : 100),
+            type: isWep ? 'weapon' : (isAmmo ? 'ammo' : 'item'),
+            category: cat,
+          });
+        }
+      }
+    }
+
+    itemsCatalog = Array.from(itemMap.values());
+    console.log(`[fivem-watch] ✓ Catálogo ox_inventory carregado (${itemsCatalog.length} itens/armas totais)`);
+  } catch (err) {
+    console.warn('[fivem-watch] Falha ao carregar catálogo de itens:', err.message);
+  }
+}
+loadItemsCatalog();
+
+app.get('/api/inventory/catalog', (req, res) => {
+  const query = String(req.query.q || '').trim().toLowerCase();
+  const category = String(req.query.category || '').trim().toLowerCase();
+
+  let results = itemsCatalog;
+
+  if (category && category !== 'all') {
+    results = results.filter((it) => it.category === category || it.type === category);
+  }
+
+  if (query) {
+    const normalize = (t) => (t || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
+    const q = normalize(query);
+    results = results.filter((it) => {
+      const n = normalize(it.name);
+      const l = normalize(it.label);
+      return n.includes(q) || l.includes(q);
+    });
+  }
+
+  const limit = req.query.limit ? parseInt(req.query.limit, 10) : null;
+  if (limit && limit > 0) {
+    results = results.slice(0, limit);
+  }
+
+  return res.json(results);
+});
+
 
 app.post('/api/ingest', (req, res) => {
   const apiKey = req.headers['x-api-key'];
@@ -515,7 +741,7 @@ app.post('/api/ingest', (req, res) => {
 
 // ─── Socket.io Connection Handling ────────────────────────────
 io.on('connection', (socket) => {
-  const { role, secret, playerId } = socket.handshake.auth;
+  const { role, secret, playerId, streamToken } = socket.handshake.auth || {};
 
   /**
    * ROLE: "fivem-server"
@@ -551,14 +777,17 @@ io.on('connection', (socket) => {
   /**
    * ROLE: "fivem-nui"
    */
-  if (role === 'fivem-nui' && secret === API_SECRET && playerId) {
+  const isSecretMatch = (secret === API_SECRET);
+  const isTokenMatch = streamToken && verifyStreamToken(playerId, streamToken, API_SECRET);
+
+  if (role === 'fivem-nui' && (isSecretMatch || isTokenMatch) && playerId) {
     const pid = String(playerId);
     if (!isValidPlayerId(pid)) {
       socket.disconnect(true);
       return;
     }
     nuiClients.set(pid, socket.id);
-    console.log(`[fivem-watch] ✓ NUI client connected for player #${pid} (${socket.id})`);
+    console.log(`[fivem-watch] ✓ NUI client connected for player #${pid} (${socket.id}) via ${isTokenMatch ? 'StreamToken' : 'Secret'}`);
 
     socket.on('frame', (data) => {
       if (!isValidFrame(data)) return;
@@ -697,34 +926,150 @@ io.on('connection', (socket) => {
       socket.emit('stream_stopped', { playerId: pid });
     });
 
-    // ─── RPC: Consulta de Inventário (Pilar 2) ──────────────────
-    socket.on('get_player_inventory', (data, callback) => {
+    // ─── Helper de RPC com Timeout de Segurança ────────────────
+    const callFiveMWithTimeout = (event, payload, timeoutMs = 6000) => {
+      return new Promise((resolve) => {
+        let isDone = false;
+        const timer = setTimeout(() => {
+          if (!isDone) {
+            isDone = true;
+            resolve({ success: false, error: `Tempo limite esgotado: FiveM não respondeu em ${timeoutMs / 1000}s.` });
+          }
+        }, timeoutMs);
+
+        try {
+          fivemServerSocket.emit(event, payload, (res) => {
+            if (!isDone) {
+              isDone = true;
+              clearTimeout(timer);
+              resolve(res || { success: true });
+            }
+          });
+        } catch (err) {
+          if (!isDone) {
+            isDone = true;
+            clearTimeout(timer);
+            resolve({ success: false, error: err.message });
+          }
+        }
+      });
+    };
+
+    // ─── RPC: Consulta de Inventário (ox_inventory) ─────────────
+    socket.on('get_player_inventory', async (data, callback) => {
       const pid = data?.playerId;
       if (!fivemServerSocket || !fivemServerSocket.connected) {
         if (typeof callback === 'function') callback({ success: false, error: 'Servidor FiveM desconectado.' });
         return;
       }
 
-      fivemServerSocket.emit('get_player_inventory', { playerId: pid }, (response) => {
-        if (typeof callback === 'function') callback(response);
-      });
+      const res = await callFiveMWithTimeout('get_player_inventory', { playerId: pid });
+      if (typeof callback === 'function') callback(res);
     });
 
-    // ─── RPC: Consulta sob Demanda de Dossiê RP (Task 4) ────────
-    socket.on('get_player_dossier', (data, callback) => {
+    // ─── RPC: Consulta sob Demanda de Dossiê RP (qbx_core) ───────
+    socket.on('get_player_dossier', async (data, callback) => {
       const pid = data?.playerId;
       if (!fivemServerSocket || !fivemServerSocket.connected) {
         if (typeof callback === 'function') callback({ success: false, error: 'Servidor FiveM desconectado.' });
         return;
       }
 
-      fivemServerSocket.emit('get_player_dossier', { playerId: pid }, (response) => {
-        if (typeof callback === 'function') callback(response);
-      });
+      const res = await callFiveMWithTimeout('get_player_dossier', { playerId: pid });
+      if (typeof callback === 'function') callback(res);
     });
 
-    // ─── RPC: Ações Administrativas Remotas (Pilar 3) ────────────
-    socket.on('admin_action', (data, callback) => {
+    // ─── RPC: Advertências Registradas (player_warns) ────────────
+    socket.on('get_player_warnings', async (data, callback) => {
+      const pid = data?.playerId;
+      if (!fivemServerSocket || !fivemServerSocket.connected) {
+        if (typeof callback === 'function') callback({ success: false, error: 'Servidor FiveM desconectado.' });
+        return;
+      }
+
+      const res = await callFiveMWithTimeout('get_player_warnings', { playerId: pid });
+      if (typeof callback === 'function') callback(res);
+    });
+
+    // ─── RPC: Inspeção de Baú / Porta-Luvas (ox_inventory) ───────
+    socket.on('get_vehicle_inventory', async (data, callback) => {
+      if (!fivemServerSocket || !fivemServerSocket.connected) {
+        if (typeof callback === 'function') callback({ success: false, error: 'Servidor FiveM desconectado.' });
+        return;
+      }
+
+      const res = await callFiveMWithTimeout('get_vehicle_inventory', data);
+      if (typeof callback === 'function') callback(res);
+    });
+
+    // ─── RPC: Lista de Bans do Servidor ─────────────────────────
+    socket.on('get_server_bans', async (data, callback) => {
+      if (!fivemServerSocket || !fivemServerSocket.connected) {
+        if (typeof callback === 'function') callback({ success: false, error: 'Servidor FiveM desconectado.' });
+        return;
+      }
+
+      const res = await callFiveMWithTimeout('get_server_bans', data);
+      if (typeof callback === 'function') callback(res);
+    });
+
+    // ─── RPC: Busca de Cidadãos na Base de Dados (Online + Offline) ──
+    socket.on('search_database_players', async (data, callback) => {
+      if (!fivemServerSocket || !fivemServerSocket.connected) {
+        if (typeof callback === 'function') callback({ success: false, error: 'Servidor FiveM desconectado.' });
+        return;
+      }
+
+      const res = await callFiveMWithTimeout('search_database_players', data, 6000);
+      if (typeof callback === 'function') callback(res);
+    });
+
+    // ─── RPC: Personagens da Conta (Multichar) ────────────────────
+    socket.on('get_player_characters', async (data, callback) => {
+      if (!fivemServerSocket || !fivemServerSocket.connected) {
+        if (typeof callback === 'function') callback({ success: false, error: 'Servidor FiveM desconectado.' });
+        return;
+      }
+
+      const res = await callFiveMWithTimeout('get_player_characters', data, 6000);
+      if (typeof callback === 'function') callback(res);
+    });
+
+    // ─── RPC: Consulta de Status de Prisão (pickle_prisons) ────────
+    socket.on('get_prisoner_status', async (data, callback) => {
+      if (!fivemServerSocket || !fivemServerSocket.connected) {
+        if (typeof callback === 'function') callback({ success: false, error: 'Servidor FiveM desconectado.' });
+        return;
+      }
+
+      const res = await callFiveMWithTimeout('get_prisoner_status', data, 6000);
+      if (typeof callback === 'function') callback(res);
+    });
+
+    // ─── RPC: Consulta de Veículos do Player (player_vehicles) ─────
+    socket.on('get_player_vehicles', async (data, callback) => {
+      if (!fivemServerSocket || !fivemServerSocket.connected) {
+        if (typeof callback === 'function') callback({ success: false, error: 'Servidor FiveM desconectado.', vehicles: [] });
+        return;
+      }
+
+      const res = await callFiveMWithTimeout('get_player_vehicles', data, 6000);
+      if (typeof callback === 'function') callback(res);
+    });
+
+    // ─── RPC: Consulta de Empregos e Facções (qbx_core) ───────────
+    socket.on('get_jobs_and_gangs', async (data, callback) => {
+      if (!fivemServerSocket || !fivemServerSocket.connected) {
+        if (typeof callback === 'function') callback({ success: false, error: 'Servidor FiveM desconectado.', jobs: {}, gangs: {} });
+        return;
+      }
+
+      const res = await callFiveMWithTimeout('get_jobs_and_gangs', data, 6000);
+      if (typeof callback === 'function') callback(res);
+    });
+
+    // ─── RPC: Ações Administrativas Remotas (Central Total) ─────
+    socket.on('admin_action', async (data, callback) => {
       if (!fivemServerSocket || !fivemServerSocket.connected) {
         if (typeof callback === 'function') callback({ success: false, error: 'Servidor FiveM desconectado.' });
         return;
@@ -739,35 +1084,35 @@ io.on('connection', (socket) => {
         adminName: staffName,
       };
 
-      fivemServerSocket.emit('admin_action', forwardData, (response) => {
-        appendAuditLog({
-          adminName: staffName,
-          category: 'moderation',
-          action: data?.action,
-          targetPlayerId: targetId,
-          targetPlayerName: player?.name || `Player ${targetId}`,
-          details: {
-            options: data?.options || {},
-            success: Boolean(response?.success),
-            result: response?.message || response?.error || 'Ação registrada.',
-          },
-        });
+      const response = await callFiveMWithTimeout('admin_action', forwardData, 8000);
 
-        sendDiscordWebhook({
-          title: `🛡️ Ação Administrativa: ${String(data?.action || 'AÇÃO').toUpperCase()}`,
-          color: response?.success ? 0xef4444 : 0xf59e0b,
-          description: `Ação remota executada via Dashboard Web por **${staffName}**.`,
-          fields: [
-            { name: 'Staff', value: staffName, inline: true },
-            { name: 'Jogador Alvo', value: `${player?.name || 'ID ' + targetId} (#${targetId})`, inline: true },
-            { name: 'Status', value: response?.success ? '✅ Sucesso' : '❌ Falhou', inline: true },
-            { name: 'Opções', value: '```json\n' + JSON.stringify(data?.options || {}, null, 2) + '\n```', inline: false },
-            { name: 'Resultado', value: String(response?.message || response?.error || 'OK'), inline: false },
-          ],
-        });
-
-        if (typeof callback === 'function') callback(response);
+      appendAuditLog({
+        adminName: staffName,
+        category: 'moderation',
+        action: data?.action,
+        targetPlayerId: targetId > 0 ? targetId : null,
+        targetPlayerName: player?.name || (targetId > 0 ? `Player ${targetId}` : 'Global Action'),
+        details: {
+          options: data?.options || {},
+          success: Boolean(response?.success),
+          result: response?.message || response?.error || 'Ação registrada.',
+        },
       });
+
+      sendDiscordWebhook({
+        title: `🛡️ Ação Administrativa: ${String(data?.action || 'AÇÃO').toUpperCase()}`,
+        color: response?.success ? 0x10b981 : 0xef4444,
+        description: `Ação remota executada via Dashboard Web por **${staffName}**.`,
+        fields: [
+          { name: 'Staff', value: staffName, inline: true },
+          { name: 'Alvo', value: targetId > 0 ? `${player?.name || 'ID ' + targetId} (#${targetId})` : 'Global / Servidor', inline: true },
+          { name: 'Status', value: response?.success ? '✅ Sucesso' : '❌ Falha', inline: true },
+          { name: 'Opções', value: '```json\n' + JSON.stringify(data?.options || {}, null, 2) + '\n```', inline: false },
+          { name: 'Resultado', value: String(response?.message || response?.error || 'OK'), inline: false },
+        ],
+      });
+
+      if (typeof callback === 'function') callback(response);
     });
 
     // ─── RPC: Histórico de Auditoria (Pilar 1) ───────────────────

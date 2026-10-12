@@ -39,6 +39,7 @@ let isCapturing = false;
 let config = {
   backendUrl: 'https://137.131.156.73.sslip.io',
   apiSecret: '',
+  streamToken: '',
   playerId: 0,
   streamFps: 20,
   streamQuality: 0.5,
@@ -299,6 +300,13 @@ window.addEventListener('message', (event) => {
       socket = null;
     }
     connectToBackend();
+  } else if (msg.type === 'setStreamToken') {
+    if (msg.streamToken) {
+      config.streamToken = msg.streamToken;
+      if (!socket || !socket.connected) {
+        connectToBackend();
+      }
+    }
   } else if (msg.type === 'stopCapture') {
     stopCapture();
   }
@@ -335,7 +343,12 @@ function connectToBackend() {
   console.log('[vanguard_dashboard] Connecting NUI socket to:', endpoint, 'player:', config.playerId);
 
   socket = io(endpoint, {
-    auth: { role: 'fivem-nui', secret: config.apiSecret, playerId: config.playerId },
+    auth: {
+      role: 'fivem-nui',
+      secret: config.apiSecret || '',
+      streamToken: config.streamToken || '',
+      playerId: config.playerId
+    },
     transports: ['websocket', 'polling'],
     reconnection: true,
     reconnectionAttempts: 30,

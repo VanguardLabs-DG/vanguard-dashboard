@@ -17,6 +17,7 @@ import {
   VideoCamera,
   CircleNotch,
   CornersOut,
+  ArrowsInSimple,
   Gear,
   Record,
   Camera,
@@ -48,6 +49,7 @@ export default function LiveStream({
   const [loading, setLoading] = useState(true);
   const [showSettings, setShowSettings] = useState(false);
   const [isMaximized, setIsMaximized] = useState(false);
+  const [isCompact, setIsCompact] = useState(false);
   const [toastMessage, setToastMessage] = useState(null);
 
   // ─── Gravação de Prova (Pilar 1: Video Clip / MediaRecorder) ───
@@ -279,18 +281,20 @@ export default function LiveStream({
   return (
     <AnimatePresence>
       <Motion.div
-        className={`stream-overlay ${isMaximized ? 'maximized' : ''} ${isGridMode ? 'grid-item' : ''}`}
+        className={`stream-overlay ${isMaximized ? 'maximized' : ''} ${isCompact ? 'compact' : ''} ${isGridMode ? 'grid-item' : ''}`}
+        drag={!isMaximized && !isGridMode}
+        dragMomentum={false}
+        dragElastic={0.05}
         initial={{ opacity: 0, y: 40, scale: 0.95 }}
         animate={{
           opacity: 1,
           y: 0,
-          x: 0,
           scale: 1,
-          width: isMaximized ? '100vw' : undefined,
+          width: isMaximized ? '100vw' : isCompact ? '320px' : undefined,
           height: isMaximized ? '100vh' : undefined,
         }}
         exit={{ opacity: 0, y: 40, scale: 0.95 }}
-        transition={{ type: 'spring', stiffness: 100, damping: 20 }}
+        transition={{ type: 'spring', stiffness: 120, damping: 20 }}
         style={
           isMaximized
             ? {
@@ -311,11 +315,12 @@ export default function LiveStream({
                 resize: 'none',
               }
             : {
-                position: 'absolute',
+                position: 'fixed',
                 top: `${80 + indexOffset * 35}px`,
                 right: `${20 + indexOffset * 30}px`,
-                zIndex: 1000 + indexOffset,
-                resize: 'both',
+                zIndex: 5500 + indexOffset,
+                cursor: 'grab',
+                resize: isCompact ? 'none' : 'both',
               }
         }
       >
@@ -378,8 +383,19 @@ export default function LiveStream({
               <Gear size={16} weight={showSettings ? 'fill' : 'regular'} />
             </button>
 
+            {/* Modo Compacto PiP para Monitoramento Concorrente */}
+            {!isGridMode && !isMaximized && (
+              <button
+                className={`btn-icon ${isCompact ? 'active' : ''}`}
+                onClick={() => setIsCompact(!isCompact)}
+                title={isCompact ? 'Restaurar tamanho normal' : 'Modo Mini Monitor (PiP compacto para usar com dossiê)'}
+              >
+                <ArrowsInSimple size={16} weight={isCompact ? 'bold' : 'regular'} />
+              </button>
+            )}
+
             {/* Maximizar */}
-            {!isGridMode && (
+            {!isGridMode && !isCompact && (
               <button
                 className="btn-icon"
                 onClick={() => setIsMaximized(!isMaximized)}

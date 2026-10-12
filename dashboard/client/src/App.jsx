@@ -9,7 +9,7 @@
  * @module App
  */
 
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useMemo } from 'react';
 import { AnimatePresence } from 'framer-motion';
 import {
   Eye,
@@ -23,6 +23,9 @@ import {
   SignOut,
   Key,
   UsersThree,
+  MagnifyingGlass,
+  Terminal,
+  Prohibit,
 } from '@phosphor-icons/react';
 
 import LoginScreen from './components/LoginScreen';
@@ -33,6 +36,8 @@ import PlayerDossierModal from './components/PlayerDossierModal';
 import AuditLogsModal from './components/AuditLogsModal';
 import ChangePasswordModal from './components/ChangePasswordModal';
 import StaffManagementModal from './components/StaffManagementModal';
+import ServerControlModal from './components/ServerControlModal';
+import SpotlightSearch from './components/SpotlightSearch';
 import ErrorBoundary from './components/ErrorBoundary';
 import { connectSocket, getSocket, disconnectSocket } from './socket';
 
@@ -73,9 +78,24 @@ export default function App() {
   const [isGridMode, setIsGridMode] = useState(false);
 
   // Modais
-  const [dossierPlayerId, setDossierPlayerId] = useState(null);
+  const [dossierTarget, setDossierTarget] = useState(null);
   const [isAuditModalOpen, setIsAuditModalOpen] = useState(false);
   const [hasNewAuditLogs, setHasNewAuditLogs] = useState(false);
+  const [isServerControlOpen, setIsServerControlOpen] = useState(false);
+  const [serverControlTab, setServerControlTab] = useState('broadcast');
+  const [isSpotlightOpen, setIsSpotlightOpen] = useState(false);
+
+  // ─── Atalho Universal Spotlight (Cmd+K / Ctrl+K) ───────────
+  useEffect(() => {
+    const handleKeyDown = (e) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
+        e.preventDefault();
+        setIsSpotlightOpen((prev) => !prev);
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, []);
 
   // ─── Socket Connection ─────────────────────────────────────
   useEffect(() => {
@@ -167,7 +187,11 @@ export default function App() {
     setStreamingPlayerIds((prev) => prev.filter((id) => id !== playerId));
   }, []);
 
-  const dossierPlayer = players.find((p) => p.id === dossierPlayerId);
+  const dossierPlayer = useMemo(() => {
+    if (!dossierTarget) return null;
+    if (typeof dossierTarget === 'object') return dossierTarget;
+    return players.find((p) => p.id === dossierTarget) || null;
+  }, [dossierTarget, players]);
 
   // ─── Not Authenticated — Show Login ────────────────────────
   if (!token) {
@@ -198,6 +222,43 @@ export default function App() {
         </div>
 
         <div className="header-status">
+          {/* Busca Rápida Spotlight (Cmd+K / Ctrl+K) */}
+          <button
+            className="btn-header-tool"
+            onClick={() => setIsSpotlightOpen(true)}
+            title="Busca Rápida de Jogadores e Comandos (Ctrl+K)"
+          >
+            <MagnifyingGlass size={16} weight="bold" />
+            <span>Busca</span>
+            <kbd className="header-kbd-badge">Ctrl+K</kbd>
+          </button>
+
+          {/* Controle Central do Servidor (Broadcast, Clima, Horário) */}
+          <button
+            className="btn-header-tool"
+            onClick={() => {
+              setServerControlTab('broadcast');
+              setIsServerControlOpen(true);
+            }}
+            title="Central do Servidor: Comunicados, Clima e Horário"
+          >
+            <Terminal size={16} weight="bold" />
+            <span>Servidor</span>
+          </button>
+
+          {/* Registro Geral de Banimentos */}
+          <button
+            className="btn-header-tool"
+            onClick={() => {
+              setServerControlTab('bans');
+              setIsServerControlOpen(true);
+            }}
+            title="Registro e Revogação Geral de Banimentos"
+          >
+            <Prohibit size={16} weight="bold" />
+            <span>Bans</span>
+          </button>
+
           {/* Botão de Auditoria / Histórico de Staff (Pilar 1) */}
           <button
             className={`btn-header-tool ${hasNewAuditLogs ? 'has-badge' : ''}`}
@@ -331,7 +392,7 @@ export default function App() {
           onSelect={setSelectedPlayerId}
           onStartStream={handleStartStream}
           onStopStream={handleStopStream}
-          onOpenDossier={(pid) => setDossierPlayerId(pid)}
+          onOpenDossier={(target) => setDossierTarget(target)}
         />
       )}
 
@@ -353,7 +414,7 @@ export default function App() {
                   indexOffset={index}
                   isGridMode={true}
                   onClose={() => handleStopStream(playerId)}
-                  onOpenDossier={(pid) => setDossierPlayerId(pid)}
+                  onOpenDossier={(pid) => setDossierTarget(pid)}
                 />
               );
             })}
@@ -372,7 +433,7 @@ export default function App() {
                   indexOffset={index}
                   isGridMode={false}
                   onClose={() => handleStopStream(playerId)}
-                  onOpenDossier={(pid) => setDossierPlayerId(pid)}
+                  onOpenDossier={(pid) => setDossierTarget(pid)}
                 />
               );
             })}
@@ -382,12 +443,13 @@ export default function App() {
 
       {/* ── Modal de Dossiê do Cidadão & Inventário (Pilar 2 & 3) ── */}
       <AnimatePresence>
-        {dossierPlayerId && dossierPlayer && (
+        {dossierPlayer && (
           <PlayerDossierModal
             player={dossierPlayer}
-            onClose={() => setDossierPlayerId(null)}
+            onClose={() => setDossierTarget(null)}
             onStartStream={handleStartStream}
-            isStreaming={streamingPlayerIds.includes(dossierPlayerId)}
+            onStopStream={handleStopStream}
+            isStreaming={dossierPlayer.id ? streamingPlayerIds.includes(dossierPlayer.id) : (dossierPlayer.onlineId ? streamingPlayerIds.includes(dossierPlayer.onlineId) : false)}
           />
         )}
       </AnimatePresence>
@@ -424,6 +486,35 @@ export default function App() {
             isMandatory={Boolean(user?.mustChangePassword)}
             onClose={() => setIsChangePasswordModalOpen(false)}
             onSuccess={handlePasswordUpdated}
+          />
+        )}
+      </AnimatePresence>
+
+      {/* ── Modal de Busca Spotlight (Cmd+K / Ctrl+K) ─────────── */}
+      <AnimatePresence>
+        {isSpotlightOpen && (
+          <SpotlightSearch
+            players={players}
+            streamingIds={streamingPlayerIds}
+            onOpenDossier={(target) => setDossierTarget(target)}
+            onStartStream={handleStartStream}
+            onFocusPlayer={(pid) => setSelectedPlayerId(pid)}
+            onOpenServerControl={(tab) => {
+              setServerControlTab(tab);
+              setIsServerControlOpen(true);
+            }}
+            onOpenAuditLogs={() => setIsAuditModalOpen(true)}
+            onClose={() => setIsSpotlightOpen(false)}
+          />
+        )}
+      </AnimatePresence>
+
+      {/* ── Modal de Controle Central do Servidor (Broadcast, Clima, Bans) ── */}
+      <AnimatePresence>
+        {isServerControlOpen && (
+          <ServerControlModal
+            initialTab={serverControlTab}
+            onClose={() => setIsServerControlOpen(false)}
           />
         )}
       </AnimatePresence>
